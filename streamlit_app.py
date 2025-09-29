@@ -22,6 +22,11 @@ st.set_page_config(page_title="onFlows MVP", layout="wide")
 
 # ---------- Helpers ----------
 def load_config():
+   def save_config(cfg):
+    with open("config.yaml", "w", encoding="utf-8") as f:
+        import yaml
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
