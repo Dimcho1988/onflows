@@ -23,6 +23,10 @@ st.set_page_config(page_title="onFlows MVP", layout="wide")
 # ---------- Helpers ----------
 def load_config():
    def save_config(cfg):
+    import yaml
+    with open("config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+   def save_config(cfg):
     with open("config.yaml", "w", encoding="utf-8") as f:
         import yaml
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -155,8 +159,19 @@ if page == "Strava":
 
             # Бърза калибрация/предложения
             rec = suggest_thresholds(df_1hz)
-            if rec:
-                st.info(f"Предложени прагове (ориентир): {rec}")
+if rec:
+    st.info(f"Предложени прагове (ориентир): {rec}")
+    if st.button("⚙️ Приложи предложенията в Настройки"):
+        # 1) обнови session_state
+        if "HRmax" in rec: st.session_state["HRmax"] = float(rec["HRmax"])
+        if "CS_run_kmh" in rec: st.session_state["CS_run_kmh"] = float(rec["CS_run_kmh"])
+        if "CP_bike_w" in rec: st.session_state["CP_bike_w"] = float(rec["CP_bike_w"])
+        # 2) запиши в config.yaml
+        if "HRmax" in rec: CFG["defaults"]["HRmax"] = float(rec["HRmax"])
+        if "CS_run_kmh" in rec: CFG["defaults"]["CS_run_kmh"] = float(rec["CS_run_kmh"])
+        if "CP_bike_w" in rec: CFG["defaults"]["CP_bike_w"] = float(rec["CP_bike_w"])
+        save_config(CFG)
+        st.success("Обновено: HRmax/CS/CP са записани в config.yaml.")
         except Exception as e:
             st.error(f"Грешка при дърпане на streams: {e}")
 
@@ -274,7 +289,6 @@ elif page == "Настройки":
         st.markdown("### Редакция на зони")
         zones = CFG["zones"].copy()
 
-        # редактор за зони: за всяка метрика и зона – два number_input
         for metric_key, zones_dict in zones.items():
             with st.expander(f"Зони за: {metric_key}", expanded=False):
                 for z_name, bounds in zones_dict.items():
@@ -291,16 +305,14 @@ elif page == "Настройки":
 
         submitted = st.form_submit_button("💾 Запази конфигурацията")
         if submitted:
-            # 1) обнови session_state
+            # обнови session_state
             st.session_state["HRmax"] = hrmax_val
             st.session_state["CS_run_kmh"] = cs_val
             st.session_state["CP_bike_w"] = cp_val
-            # 2) запиши във файла
+            # запиши във файла
             CFG["defaults"]["HRmax"] = hrmax_val
             CFG["defaults"]["CS_run_kmh"] = cs_val
             CFG["defaults"]["CP_bike_w"] = cp_val
             CFG["zones"] = zones
             save_config(CFG)
-            st.success("Запазено в config.yaml. Рестартирането не е нужно – стойностите са активни.")
-
-    st.info("Съвет: след като изтеглиш 1 Hz таблица в „Strava“, ще видиш **предложени прагове** (ориентир). Можеш да ги прехвърлиш тук.")
+            st.success("Запазено в config.yaml и приложено веднага.")
