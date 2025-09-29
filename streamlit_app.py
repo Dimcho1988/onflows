@@ -4,12 +4,12 @@ import json
 import yaml
 import time
 import base64
+import pathlib
+import requests
 import pandas as pd
 import numpy as np
-import requests
 import streamlit as st
-
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from strava_streams import StravaClient, build_timeseries_1hz
 from normalize import add_percent_columns
@@ -17,22 +17,17 @@ from indices import compute_tiz, compute_daily_stress, aggregate_daily_stress, c
 from calibration import infer_modalities, suggest_thresholds
 from generator import generate_plan
 
+# -------------------- App setup --------------------
 st.set_page_config(page_title="onFlows MVP", layout="wide")
 
-
-# ---------- Helpers ----------
+# ---------- Config load/save ----------
 def load_config():
-   def save_config(cfg):
-    import yaml
-    with open("config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
-   def save_config(cfg):
-    with open("config.yaml", "w", encoding="utf-8") as f:
-        import yaml
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
-
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+def save_config(cfg):
+    with open("config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
 CFG = load_config()
 
@@ -41,13 +36,13 @@ def init_state():
     st.session_state.setdefault("HRmax", d["HRmax"])
     st.session_state.setdefault("CS_run_kmh", d["CS_run_kmh"])
     st.session_state.setdefault("CP_bike_w", d["CP_bike_w"])
-    st.session_state.setdefault("strava_token", None)
+    st.session_state.setdefault("strava_token_full", None)  # целият токен обект
     st.session_state.setdefault("activities_cache", None)
-    st.session_state.setdefault("meta_log", [])  # за дневен стрес
+    st.session_state.setdefault("meta_log", [])  # за дневен стрес / ACWR
 init_state()
 
+# ---------- Secrets / OAuth helpers ----------
 def app_redirect_uri():
-    # Streamlit Cloud → Secrets: APP_REDIRECT_URI
     return st.secrets.get("APP_REDIRECT_URI", "http://localhost:8501")
 
 def strava_oauth_url():
@@ -70,10 +65,57 @@ def exchange_code_for_token(code: str) -> dict:
         "code": code,
         "grant_type": "authorization_code"
     }
-    r = requests.post(url, data=payload)
+    r = requests.post(url, data=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
+# ---------- Token cache & refresh ----------
+TOKEN_PATH = pathlib.Path.home() / ".streamlit" / "onflows_strava_token.json"
+
+def save_token_to_disk(token: dict):
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+        json.dump(token, f)
+
+def load_token_from_disk() -> dict | None:
+    if TOKEN_PATH.exists():
+        with open(TOKEN_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+def refresh_access_token(refresh_token: str) -> dict:
+    url = "https://www.strava.com/oauth/token"
+    payload = {
+        "client_id": st.secrets["STRAVA_CLIENT_ID"],
+        "client_secret": st.secrets["STRAVA_CLIENT_SECRET"],
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    r = requests.post(url, data=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def ensure_strava_token() -> str | None:
+    """
+    Връща валиден access_token. Ползва session_state + локален кеш и авто-рефреш.
+    """
+    tok = st.session_state.get("strava_token_full") or load_token_from_disk()
+    if not tok:
+        return None
+    # ако е на път да изтече → освежи
+    if time.time() >= float(tok.get("expires_at", 0)) - 30:
+        try:
+            tok = refresh_access_token(tok["refresh_token"])
+            st.session_state["strava_token_full"] = tok
+            save_token_to_disk(tok)
+        except Exception as e:
+            st.warning(f"Изтекъл токен. Нужно е ново вписване в Strava. ({e})")
+            return None
+    st.session_state["strava_token_full"] = tok
+    save_token_to_disk(tok)
+    return tok["access_token"]
+
+# ---------- Download helpers ----------
 def download_csv_button(df: pd.DataFrame, label: str, filename: str):
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(label, data=csv, file_name=filename, mime="text/csv")
@@ -82,39 +124,45 @@ def download_excel_button(df: pd.DataFrame, label: str, filename: str):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         df.to_excel(xw, index=False, sheet_name="Plan")
-    st.download_button(label, data=buf.getvalue(), file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(label, data=buf.getvalue(), file_name=filename,
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-
-# ---------- Sidebar ----------
+# -------------------- Sidebar / Navigation --------------------
 st.sidebar.title("onFlows")
 page = st.sidebar.radio("Меню", ["Strava", "Индекси", "Генератор", "Настройки"])
 
-
-# ---------- STRAVA PAGE ----------
+# ============================================================
+# STRAVA PAGE
+# ============================================================
 if page == "Strava":
     st.header("Strava – OAuth, активности и 1 Hz таблица")
 
-    # 1) OAuth
-    params = st.experimental_get_query_params()
-    if "code" in params and not st.session_state["strava_token"]:
+    # Четене на query params (новия API)
+    params = st.query_params
+
+    # Ако се върнем от OAuth с ?code=...
+    if "code" in params:
         try:
-            token_data = exchange_code_for_token(params["code"][0])
-            st.session_state["strava_token"] = token_data["access_token"]
+            token_data = exchange_code_for_token(params["code"])
+            st.session_state["strava_token_full"] = token_data
+            save_token_to_disk(token_data)
             st.success("✅ Успешен вход в Strava!")
-            # Премахни code от адреса
-            st.experimental_set_query_params()
+            # изчисти URL параметрите
+            st.query_params.clear()
         except Exception as e:
             st.error(f"Грешка при обмен на код за токен: {e}")
 
-    if not st.session_state["strava_token"]:
-        st.markdown("1) Натисни бутона за вход → одобри достъпа → връщаш се тук автоматично.")
+    # Осигури валиден токен (от кеш или рефреш)
+    access_token = ensure_strava_token()
+    if not access_token:
+        st.markdown("1) Натисни бутона за вход → одобри достъпа → ще те върне тук.")
         if st.button("🔐 Вход със Strava"):
             st.markdown(f"[Отвори Strava OAuth]({strava_oauth_url()})")
         st.stop()
 
-    client = StravaClient(st.session_state["strava_token"])
+    client = StravaClient(access_token)
 
-    # 2) Списък активности
+    # Списък активности
     if st.button("🔄 Обнови активностите (последни 10)"):
         try:
             acts = client.get_athlete_activities(per_page=10)
@@ -139,7 +187,7 @@ if page == "Strava":
     else:
         st.info("Няма кеширани активности. Натисни „Обнови активностите“.")
 
-    # 3) Избор на активност → Streams → 1 Hz
+    # Избор на активност → 1 Hz
     activity_id = st.text_input("Въведи activity_id за 1 Hz таблица:", placeholder="напр. 1234567890")
     if st.button("⬇️ Дърпай streams и направи 1 Hz"):
         if not activity_id.strip().isdigit():
@@ -153,30 +201,33 @@ if page == "Strava":
                 st.stop()
             st.success(f"1 Hz таблица: {len(df_1hz)} реда.")
             st.dataframe(df_1hz.head(300), use_container_width=True)
-            # Download
+
+            # Download CSV
             dl = df_1hz.reset_index().rename(columns={"second":"t_sec"})
             download_csv_button(dl, "💾 Download 1Hz CSV", f"activity_{activity_id}_1hz.csv")
 
-            # Бърза калибрация/предложения
+            # Предложени прагове (ориентир) + бутон за прилагане
             rec = suggest_thresholds(df_1hz)
-if rec:
-    st.info(f"Предложени прагове (ориентир): {rec}")
-    if st.button("⚙️ Приложи предложенията в Настройки"):
-        # 1) обнови session_state
-        if "HRmax" in rec: st.session_state["HRmax"] = float(rec["HRmax"])
-        if "CS_run_kmh" in rec: st.session_state["CS_run_kmh"] = float(rec["CS_run_kmh"])
-        if "CP_bike_w" in rec: st.session_state["CP_bike_w"] = float(rec["CP_bike_w"])
-        # 2) запиши в config.yaml
-        if "HRmax" in rec: CFG["defaults"]["HRmax"] = float(rec["HRmax"])
-        if "CS_run_kmh" in rec: CFG["defaults"]["CS_run_kmh"] = float(rec["CS_run_kmh"])
-        if "CP_bike_w" in rec: CFG["defaults"]["CP_bike_w"] = float(rec["CP_bike_w"])
-        save_config(CFG)
-        st.success("Обновено: HRmax/CS/CP са записани в config.yaml.")
+            if rec:
+                st.info(f"Предложени прагове (ориентир): {rec}")
+                if st.button("⚙️ Приложи предложенията в Настройки"):
+                    # към session_state
+                    if "HRmax" in rec: st.session_state["HRmax"] = float(rec["HRmax"])
+                    if "CS_run_kmh" in rec: st.session_state["CS_run_kmh"] = float(rec["CS_run_kmh"])
+                    if "CP_bike_w" in rec: st.session_state["CP_bike_w"] = float(rec["CP_bike_w"])
+                    # и към config.yaml
+                    if "HRmax" in rec:     CFG["defaults"]["HRmax"]       = float(rec["HRmax"])
+                    if "CS_run_kmh" in rec: CFG["defaults"]["CS_run_kmh"] = float(rec["CS_run_kmh"])
+                    if "CP_bike_w" in rec:  CFG["defaults"]["CP_bike_w"]  = float(rec["CP_bike_w"])
+                    save_config(CFG)
+                    st.success("Обновено: HRmax/CS/CP са записани в config.yaml.")
+
         except Exception as e:
             st.error(f"Грешка при дърпане на streams: {e}")
 
-
-# ---------- INDICES PAGE ----------
+# ============================================================
+# INDICES PAGE
+# ============================================================
 elif page == "Индекси":
     st.header("Индекси – TIZ, дневен стрес, ACWR, HR drift")
 
@@ -185,9 +236,7 @@ elif page == "Индекси":
 
     if uploaded:
         df = pd.read_csv(uploaded)
-        # очакваме t_sec + колони от 1 Hz
-        df = df.rename(columns={"t_sec":"second"})
-        df = df.set_index("second")
+        df = df.rename(columns={"t_sec":"second"}).set_index("second")
 
         # Нормализация
         zones_cfg = CFG["zones"]
@@ -215,34 +264,33 @@ elif page == "Индекси":
         else:
             st.metric("HR drift (decoupling)", f"{drift*100:.1f}%")
 
-        # Добави в дневния лог (за ACWR)
+        # ACWR лог
         date_str = st.text_input("Дата на активността (YYYY-MM-DD)", value=datetime.now().strftime("%Y-%m-%d"))
         if st.button("➕ Добави активността в дневния стрес"):
             st.session_state["meta_log"].append({"date": date_str, "stress": stress})
-            st.success("Добавено. Отиди долу за ACWR.")
+            st.success("Добавено. Долу виж ACWR.")
 
     # ACWR секция
     st.subheader("ACWR (7/28)")
     if st.session_state["meta_log"]:
         meta_df = pd.DataFrame(st.session_state["meta_log"])
-        # нормализирай дата
-        meta_df["date"] = pd.to_datetime(meta_df["date"]).dt.date
+        meta_df["date"] = pd.to_datetime(meta_df["date"])
         series = aggregate_daily_stress(meta_df.assign(date=pd.to_datetime(meta_df["date"])))
         acwr = compute_acwr(series)
         if not acwr.empty:
             latest_date = acwr.index.max()
             st.metric("Последен ACWR", f"{acwr.loc[latest_date]:.2f}")
-        st.write("Дневен стрес:")
+        st.write("Дневен стрес (по дати):")
         st.dataframe(series.to_frame(name="stress"), use_container_width=True)
     else:
         st.info("Добави поне една активност с дата, за да видиш ACWR.")
 
-
-# ---------- GENERATOR PAGE ----------
+# ============================================================
+# GENERATOR PAGE
+# ============================================================
 elif page == "Генератор":
     st.header("Генератор – седмичен план с адаптация по ACWR")
 
-    # Лек state от „Индекси“
     latest_acwr = 1.0
     if st.session_state.get("meta_log"):
         meta_df = pd.DataFrame(st.session_state["meta_log"])
@@ -254,7 +302,6 @@ elif page == "Генератор":
 
     st.write(f"Текущ ACWR (ако има данни): **{latest_acwr:.2f}**")
 
-    # Календар/дни
     base_calendar = ["Пон","Вто","Сря","Чет","Пет","Съб","Нед"]
 
     athlete_state = {
@@ -266,11 +313,11 @@ elif page == "Генератор":
 
     plan = generate_plan(athlete_state, indices_ctx, base_calendar, CFG)
     st.dataframe(plan, use_container_width=True)
-
     download_excel_button(plan, "💾 Download седмичен план (Excel)", "onflows_week_plan.xlsx")
 
-
-# ---------- SETTINGS PAGE ----------
+# ============================================================
+# SETTINGS PAGE (editable + save)
+# ============================================================
 elif page == "Настройки":
     st.header("Настройки – HRmax / CS / CP и зони (редакция)")
 
@@ -288,7 +335,6 @@ elif page == "Настройки":
 
         st.markdown("### Редакция на зони")
         zones = CFG["zones"].copy()
-
         for metric_key, zones_dict in zones.items():
             with st.expander(f"Зони за: {metric_key}", expanded=False):
                 for z_name, bounds in zones_dict.items():
@@ -305,14 +351,14 @@ elif page == "Настройки":
 
         submitted = st.form_submit_button("💾 Запази конфигурацията")
         if submitted:
-            # обнови session_state
             st.session_state["HRmax"] = hrmax_val
             st.session_state["CS_run_kmh"] = cs_val
             st.session_state["CP_bike_w"] = cp_val
-            # запиши във файла
+
             CFG["defaults"]["HRmax"] = hrmax_val
             CFG["defaults"]["CS_run_kmh"] = cs_val
             CFG["defaults"]["CP_bike_w"] = cp_val
             CFG["zones"] = zones
             save_config(CFG)
             st.success("Запазено в config.yaml и приложено веднага.")
+
