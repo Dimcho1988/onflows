@@ -257,26 +257,50 @@ elif page == "Генератор":
 
 # ---------- SETTINGS PAGE ----------
 elif page == "Настройки":
-    st.header("Настройки – HRmax / CS / CP и зони")
+    st.header("Настройки – HRmax / CS / CP и зони (редакция)")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.session_state["HRmax"] = st.number_input("HRmax (bpm)", min_value=120, max_value=230, value=int(st.session_state["HRmax"]))
-    with col2:
-        st.session_state["CS_run_kmh"] = st.number_input("CS (бягане) km/h", min_value=8.0, max_value=26.0, value=float(st.session_state["CS_run_kmh"]), step=0.1)
-    with col3:
-        st.session_state["CP_bike_w"] = st.number_input("CP (колоездене) W", min_value=80, max_value=500, value=int(st.session_state["CP_bike_w"]))
+    with st.form("settings_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            hrmax_val = st.number_input("HRmax (bpm)", min_value=120, max_value=230,
+                                        value=int(st.session_state["HRmax"]))
+        with col2:
+            cs_val = st.number_input("CS (бягане) km/h", min_value=8.0, max_value=26.0,
+                                     value=float(st.session_state["CS_run_kmh"]), step=0.1)
+        with col3:
+            cp_val = st.number_input("CP (колоездене) W", min_value=80, max_value=500,
+                                     value=int(st.session_state["CP_bike_w"]))
 
-    st.markdown("Зоните са дефинирани в `config.yaml`. В следващи версии ще добавим UI за редакция.")
-    st.json(CFG["zones"])
+        st.markdown("### Редакция на зони")
+        zones = CFG["zones"].copy()
 
-    st.info("Секрети за Strava/Redirect се добавят в Streamlit Cloud → Settings → Secrets:")
-    st.code(
-        'STRAVA_CLIENT_ID = "XXXX"\n'
-        'STRAVA_CLIENT_SECRET = "YYYY"\n'
-        'APP_REDIRECT_URI = "https://onflows.streamlit.app"\n',
-        language="bash"
-    )
+        # редактор за зони: за всяка метрика и зона – два number_input
+        for metric_key, zones_dict in zones.items():
+            with st.expander(f"Зони за: {metric_key}", expanded=False):
+                for z_name, bounds in zones_dict.items():
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        lo = st.number_input(f"{metric_key}.{z_name} – долна граница",
+                                             key=f"{metric_key}_{z_name}_lo",
+                                             value=float(bounds[0]), step=0.01, format="%.2f")
+                    with c2:
+                        hi = st.number_input(f"{metric_key}.{z_name} – горна граница",
+                                             key=f"{metric_key}_{z_name}_hi",
+                                             value=float(bounds[1]), step=0.01, format="%.2f")
+                    zones[metric_key][z_name] = [float(lo), float(hi)]
 
-    st.markdown("Локално стартиране:")
-    st.code("pip install -r requirements.txt\nstreamlit run streamlit_app.py", language="bash")
+        submitted = st.form_submit_button("💾 Запази конфигурацията")
+        if submitted:
+            # 1) обнови session_state
+            st.session_state["HRmax"] = hrmax_val
+            st.session_state["CS_run_kmh"] = cs_val
+            st.session_state["CP_bike_w"] = cp_val
+            # 2) запиши във файла
+            CFG["defaults"]["HRmax"] = hrmax_val
+            CFG["defaults"]["CS_run_kmh"] = cs_val
+            CFG["defaults"]["CP_bike_w"] = cp_val
+            CFG["zones"] = zones
+            save_config(CFG)
+            st.success("Запазено в config.yaml. Рестартирането не е нужно – стойностите са активни.")
+
+    st.info("Съвет: след като изтеглиш 1 Hz таблица в „Strava“, ще видиш **предложени прагове** (ориентир). Можеш да ги прехвърлиш тук.")
