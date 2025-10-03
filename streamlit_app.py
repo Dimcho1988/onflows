@@ -163,33 +163,34 @@ if page == "Strava":
     client = StravaClient(access_token)
 
     # Списък активности
-    if st.button("🔄 Обнови активностите (последни 10)"):
-        try:
-            acts = client.get_athlete_activities(per_page=10)
-            st.session_state["activities_cache"] = acts
-            st.success("Заредени са последните 10 активности.")
-        except Exception as e:
-            st.error(f"Грешка при заявка към Strava: {e}")
+if st.button("🔄 Обнови активностите (последни 10)"):
+    try:
+        acts = client.get_athlete_activities(per_page=10)
+        st.session_state["activities_cache"] = acts
+        st.success("Заредени са последните 10 активности.")
+    except Exception as e:
+        st.error(f"Грешка при заявка към Strava: {e}")
 
-    acts = st.session_state.get("activities_cache") or []
-    if acts:
-        df_acts = pd.DataFrame([{
-            "id": a["id"],
-            "name": a.get("name"),
-            "type": a.get("type"),
-            "start_date_local": a.get("start_date_local"),
-            "distance_km": round((a.get("distance", 0) or 0)/1000.0, 2),
-            "moving_time_min": int((a.get("moving_time", 0) or 0)/60),
-            "avg_hr": a.get("average_heartrate", None),
-            "avg_speed_kmh": round((a.get("average_speed", 0) or 0)*3.6, 2)
-        } for a in acts])
-        st.dataframe(df_acts, use_container_width=True)
-            # Запис в Supabase
-    n = save_activities_to_db(df)
+acts = st.session_state.get("activities_cache") or []
+if acts:
+    df_acts = pd.DataFrame([{
+        "id": a["id"],
+        "name": a.get("name"),
+        "type": a.get("type"),
+        "start_date_local": a.get("start_date_local"),
+        "distance_km": round(a.get("distance", 0) / 1000.0, 2),
+        "moving_time_min": int(a.get("moving_time", 0) / 60),
+        "avg_hr": a.get("average_heartrate", None),
+        "avg_speed_kmh": round((a.get("average_speed", 0) or 0) * 3.6, 2),
+    } for a in acts])
+
+    st.dataframe(df_acts, use_container_width=True)
+
+    # 👉 Тук добавяме запис в Supabase
+    n = save_activities_to_db(df_acts)
     st.success(f"Записани/обновени в Supabase: {n} активности.")
-
-    else:
-        st.info("Няма кеширани активности. Натисни „Обнови активностите“.")
+else:
+    st.info("Няма кеширани активности. Натисни „Обнови активностите“.")
 
     # Избор на активност → 1 Hz
     activity_id = st.text_input("Въведи activity_id за 1 Hz таблица:", placeholder="напр. 1234567890")
