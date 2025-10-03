@@ -184,6 +184,10 @@ if page == "Strava":
             "avg_speed_kmh": round((a.get("average_speed", 0) or 0)*3.6, 2)
         } for a in acts])
         st.dataframe(df_acts, use_container_width=True)
+            # Запис в Supabase
+    n = save_activities_to_db(df)
+    st.success(f"Записани/обновени в Supabase: {n} активности.")
+
     else:
         st.info("Няма кеширани активности. Натисни „Обнови активностите“.")
 
