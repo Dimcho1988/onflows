@@ -1,93 +1,169 @@
 # db.py
 import os
+from contextlib import contextmanager
+
+try:
+    import streamlit as st
+    _HAS_ST = True
+except Exception:
+    _HAS_ST = False
+
 import psycopg2
-import psycopg2.extras
+import psycopg2.extras as pgx
 
-DB_URL = os.getenv("DB_URL") or os.environ.get("POSTGRES_URL")
 
+def _get_secret(key: str, default: str = None) -> str:
+    if _HAS_ST and "secrets" in dir(st) and key in st.secrets:
+        return st.secrets[key]
+    return os.getenv(key, default)
+
+
+DB_URL = _get_secret("DB_URL")
+if not DB_URL:
+    raise RuntimeError("DB_URL not found in secrets or environment!")
+
+
+@contextmanager
 def get_conn():
-    if not DB_URL:
-        raise RuntimeError("DB_URL env var is required (add it in Streamlit/Actions Secrets).")
-    return psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(DB_URL)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-def upsert_athlete(strava_athlete_id: int, firstname: str = None, lastname: str = None):
+
+def upsert_athlete(strava_athlete_id: int, firstname: str = None, lastname: str = None) -> int:
+    """Returns internal athlete id."""
     sql = """
-    insert into athletes (strava_athlete_id, firstname, lastname)
-    values (%s, %s, %s)
-    on conflict (strava_athlete_id) do update
-      set firstname = excluded.firstname,
-          lastname  = excluded.lastname
-    returning id;
+    INSERT INTO athletes (strava_athlete_id, firstname, lastname)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (strava_athlete_id) DO UPDATE
+      SET firstname = EXCLUDED.firstname,
+          lastname  = EXCLUDED.lastname
+    RETURNING id;
     """
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (strava_athlete_id, firstname, lastname))
-        return cur.fetchone()[0]
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (strava_athlete_id, firstname, lastname))
+            rid = cur.fetchone()[0]
+            conn.commit()
+            return rid
+
 
 def upsert_token(athlete_id: int, access_token: str, refresh_token: str, expires_at: int, scope: str = None):
     sql = """
-    insert into strava_tokens (athlete_id, access_token, refresh_token, expires_at, scope)
-    values (%s, %s, %s, %s, %s)
-    on conflict (athlete_id) do update
-      set access_token = excluded.access_token,
-          refresh_token = excluded.refresh_token,
-          expires_at = excluded.expires_at,
-          scope = excluded.scope,
-          updated_at = now();
+    INSERT INTO strava_tokens (athlete_id, access_token, refresh_token, expires_at, scope)
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (athlete_id) DO UPDATE
+       SET access_token = EXCLUDED.access_token,
+           refresh_token = EXCLUDED.refresh_token,
+           expires_at = EXCLUDED.expires_at,
+           scope = COALESCE(EXCLUDED.scope, strava_tokens.scope),
+           updated_at = NOW();
     """
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (athlete_id, access_token, refresh_token, expires_at, scope))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (athlete_id, access_token, refresh_token, expires_at, scope))
+            conn.commit()
 
-def get_last_activity_start(athlete_id: int):
-    sql = "select max(start_date) from activities where athlete_id=%s"
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (athlete_id,))
-        row = cur.fetchone()
-        return row[0]  # may be None
 
-def upsert_activity(act: dict, athlete_id: int):
+def get_all_tokens():
+    """Return list of dicts {athlete_id, access_token, refresh_token, expires_at}."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=pgx.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM strava_tokens;")
+            return list(cur.fetchall())
+
+
+def last_activity_start(athlete_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(start_date) FROM activities WHERE athlete_id=%s;", (athlete_id,))
+            row = cur.fetchone()
+            return row[0]  # may be None
+
+
+def upsert_activity(activity: dict, athlete_id: int):
+    """
+    Expects minimal Strava activity fields + precomputed values:
+    id, name, type, start_date, distance, moving_time, average_heartrate, average_speed
+    """
     sql = """
-    insert into activities
-      (id, athlete_id, name, type, start_date, distance_m, moving_time_s, avg_hr, avg_speed_mps, raw)
-    values
-      (%(id)s, %(athlete_id)s, %(name)s, %(type)s, %(start_date)s, %(distance_m)s, %(moving_time_s)s,
-       %(avg_hr)s, %(avg_speed_mps)s, %(raw)s)
-    on conflict (id) do nothing;
-    """
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, act | {"athlete_id": athlete_id})
-
-def upsert_metrics(activity_id: int, tiz: dict, stress: float, hr_drift):
-    sql = """
-    insert into activity_metrics
-      (activity_id, tiz_z1_minutes, tiz_z2_minutes, tiz_z3_minutes, tiz_z4_minutes, tiz_z5_minutes,
-       stress, hr_drift)
-    values
-      (%s,%s,%s,%s,%s,%s,%s,%s)
-    on conflict (activity_id) do update
-      set tiz_z1_minutes=excluded.tiz_z1_minutes,
-          tiz_z2_minutes=excluded.tiz_z2_minutes,
-          tiz_z3_minutes=excluded.tiz_z3_minutes,
-          tiz_z4_minutes=excluded.tiz_z4_minutes,
-          tiz_z5_minutes=excluded.tiz_z5_minutes,
-          stress=excluded.stress,
-          hr_drift=excluded.hr_drift,
-          computed_at=now();
-    """
-    vals = (
-        activity_id,
-        float(tiz.get("Z1", 0)), float(tiz.get("Z2", 0)), float(tiz.get("Z3", 0)),
-        float(tiz.get("Z4", 0)), float(tiz.get("Z5", 0)),
-        float(stress), None if hr_drift is None else float(hr_drift),
+    INSERT INTO activities (
+        id, athlete_id, name, type, start_date,
+        distance_m, moving_time_s, avg_hr, avg_speed_mps, raw
     )
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, vals)
+    VALUES (%(id)s, %(athlete_id)s, %(name)s, %(type)s, %(start_date)s,
+            %(distance_m)s, %(moving_time_s)s, %(avg_hr)s, %(avg_speed_mps)s, %(raw)s)
+    ON CONFLICT (id) DO UPDATE
+      SET name = EXCLUDED.name,
+          type = EXCLUDED.type,
+          start_date = EXCLUDED.start_date,
+          distance_m = EXCLUDED.distance_m,
+          moving_time_s = EXCLUDED.moving_time_s,
+          avg_hr = EXCLUDED.avg_hr,
+          avg_speed_mps = EXCLUDED.avg_speed_mps,
+          raw = EXCLUDED.raw;
+    """
+    rec = {
+        "id": activity["id"],
+        "athlete_id": athlete_id,
+        "name": activity.get("name"),
+        "type": activity.get("type"),
+        "start_date": activity.get("start_date"),  # aware timestamp
+        "distance_m": activity.get("distance", 0.0),
+        "moving_time_s": activity.get("moving_time", 0),
+        "avg_hr": activity.get("average_heartrate"),
+        "avg_speed_mps": activity.get("average_speed"),
+        "raw": pgx.Json(activity),
+    }
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, rec)
+            conn.commit()
+
+
+def upsert_metrics(activity_id: int, tiz_minutes: dict, stress: float, hr_drift: float | None):
+    sql = """
+    INSERT INTO activity_metrics (
+        activity_id,
+        tiz_z1_minutes, tiz_z2_minutes, tiz_z3_minutes, tiz_z4_minutes, tiz_z5_minutes,
+        stress, hr_drift
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (activity_id) DO UPDATE
+      SET tiz_z1_minutes=EXCLUDED.tiz_z1_minutes,
+          tiz_z2_minutes=EXCLUDED.tiz_z2_minutes,
+          tiz_z3_minutes=EXCLUDED.tiz_z3_minutes,
+          tiz_z4_minutes=EXCLUDED.tiz_z4_minutes,
+          tiz_z5_minutes=EXCLUDED.tiz_z5_minutes,
+          stress=EXCLUDED.stress,
+          hr_drift=EXCLUDED.hr_drift,
+          computed_at = NOW();
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                activity_id,
+                tiz_minutes.get("Z1", 0.0),
+                tiz_minutes.get("Z2", 0.0),
+                tiz_minutes.get("Z3", 0.0),
+                tiz_minutes.get("Z4", 0.0),
+                tiz_minutes.get("Z5", 0.0),
+                stress,
+                hr_drift,
+            ))
+            conn.commit()
+
 
 def upsert_daily_stress(athlete_id: int, day, stress: float):
     sql = """
-    insert into daily_stress(athlete_id, day, stress)
-    values (%s, %s, %s)
-    on conflict (athlete_id, day) do update
-      set stress = excluded.stress;
+    INSERT INTO daily_stress (athlete_id, day, stress)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (athlete_id, day) DO UPDATE
+      SET stress = EXCLUDED.stress;
     """
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (athlete_id, day, float(stress)))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (athlete_id, day, stress))
+            conn.commit()
