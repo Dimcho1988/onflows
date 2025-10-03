@@ -161,15 +161,36 @@ if page == "Strava":
         except Exception as e:
             st.error(f"Грешка при обмен на код за токен: {e}")
 
-    # Осигури валиден токен (от кеш или рефреш)
-    access_token = ensure_strava_token()
-    if not access_token:
-        st.markdown("1) Натисни бутона за вход → одобри достъпа → ще те върне тук.")
-        if st.button("🔐 Вход със Strava"):
-            st.markdown(f"[Отвори Strava OAuth]({strava_oauth_url()})")
-        st.stop()
+    # --- Strava статус / вход-изход ---
+st.markdown("### Strava вход")
 
-    client = StravaClient(access_token)
+# бутон изход: чисти токена от паметта и диска и презарежда
+if st.button("🚪 Изход от Strava"):
+    st.session_state.pop("strava_token_full", None)
+    try:
+        TOKEN_PATH.unlink()   # ~/.streamlit/onflows_strava_token.json
+    except Exception:
+        pass
+    st.success("Излязохте от Strava.")
+    st.rerun()
+
+# ако няма никакъв токен → покажи вход
+cached = st.session_state.get("strava_token_full") or load_token_from_disk()
+if not cached:
+    st.info("Не сте вписан в Strava.")
+    # ако имаш нова версия на Streamlit: st.link_button("🔐 Вход със Strava", strava_oauth_url())
+    if st.button("🔐 Вход със Strava"):
+        st.markdown(f"[Отвори Strava OAuth]({strava_oauth_url()})")
+    st.stop()
+
+# иначе осигури валиден access_token (вкл. авто-рефреш)
+access_token = ensure_strava_token()
+if not access_token:
+    st.warning("Трябва да се впишете отново в Strava.")
+    st.stop()
+
+client = StravaClient(access_token)
+
 
     # -------------- Списък активности --------------
     if st.button("🔄 Обнови активностите (последни 10)"):
