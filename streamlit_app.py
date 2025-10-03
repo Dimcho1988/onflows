@@ -382,4 +382,88 @@ if "Strava" in st.session_state.get("page", "Strava"):
     st.subheader("OAuth Login")
     strava_login_button()
     st.markdown("---")
+# =========================
+# onFlows: Save activities to Supabase
+# =========================
+import psycopg2
+import psycopg2.extras
+import pandas as pd
+import streamlit as st
+
+def _get_conn():
+    return psycopg2.connect(st.secrets["DB_URL"])
+
+def _ensure_activities_table():
+    ddl = """
+    CREATE TABLE IF NOT EXISTS activities (
+        id               BIGINT PRIMARY KEY,
+        name             TEXT,
+        type             TEXT,
+        start_date_local TIMESTAMPTZ,
+        distance_km      DOUBLE PRECISION,
+        moving_time_min  DOUBLE PRECISION,
+        avg_hr           DOUBLE PRECISION,
+        avg_speed_kmh    DOUBLE PRECISION,
+        inserted_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    """
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        conn.commit()
+
+def save_activities_to_db(df: pd.DataFrame) -> int:
+    """
+    Expects df columns:
+    id, name, type, start_date_local, distance_km, moving_time_min, avg_hr, avg_speed_kmh
+    Returns number of rows upserted.
+    """
+    required = [
+        "id", "name", "type", "start_date_local",
+        "distance_km", "moving_time_min", "avg_hr", "avg_speed_kmh"
+    ]
+    # rename if your dataframe uses slightly different names
+    rename_map = {
+        "start_date": "start_date_local",
+        "distance": "distance_km",
+        "moving_time": "moving_time_min",
+        "average_heartrate": "avg_hr",
+        "avg_speed": "avg_speed_kmh",
+    }
+    for k, v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df = df.rename(columns={k: v})
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.warning(f"Липсващи колони в DF за запис: {missing}")
+        return 0
+
+    _ensure_activities_table()
+
+    rows = df[required].copy()
+    # Увери се, че датата е в tz-aware формат (ако е string)
+    if rows["start_date_local"].dtype == "object":
+        rows["start_date_local"] = pd.to_datetime(rows["start_date_local"], errors="coerce", utc=True)
+
+    data = [tuple(x) for x in rows.to_numpy()]
+
+    upsert_sql = """
+        INSERT INTO activities
+        (id, name, type, start_date_local, distance_km, moving_time_min, avg_hr, avg_speed_kmh)
+        VALUES %s
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            type = EXCLUDED.type,
+            start_date_local = EXCLUDED.start_date_local,
+            distance_km = EXCLUDED.distance_km,
+            moving_time_min = EXCLUDED.moving_time_min,
+            avg_hr = EXCLUDED.avg_hr,
+            avg_speed_kmh = EXCLUDED.avg_speed_kmh;
+    """
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, upsert_sql, data, page_size=500)
+        conn.commit()
+    return len(data)
 
