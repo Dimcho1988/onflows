@@ -3,6 +3,5 @@ requests
 pandas
 numpy
 openpyxl
-pyyaml
 psycopg2-binary
 pyyaml
