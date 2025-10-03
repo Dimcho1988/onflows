@@ -196,8 +196,20 @@ page = st.sidebar.radio("Меню", ["Strava", "Индекси", "Генерат
 # ============================================================
 # STRAVA PAGE (във функция, за да няма проблеми с отстъпи)
 # ============================================================
+
 def render_strava():
     st.header("Strava – OAuth, активности и 1 Hz таблица")
+
+    # 0) Винаги показваме линк към OAuth (удобно за релогване)
+    auth_url = strava_oauth_url()
+    colA, colB = st.columns([1, 4])
+    with colA:
+        # Ако имаш по-нова версия на Streamlit:
+        try:
+            st.link_button("🔐 Вход със Strava", auth_url, help="Отвори Strava OAuth")
+        except Exception:
+            # fallback за по-стари версии
+            st.markdown(f"[🔐 Вход със Strava]({auth_url})")
 
     # 1) Ако сме върнати с ?code=...
     params = st.query_params
@@ -214,9 +226,7 @@ def render_strava():
     # 2) Осигури валиден токен
     access_token = ensure_strava_token()
     if not access_token:
-        st.markdown("1) Натисни бутона за вход → одобри достъпа → ще те върне тук.")
-        if st.button("🔐 Вход със Strava"):
-            st.markdown(f"[Отвори Strava OAuth]({strava_oauth_url()})")
+        st.info("Натисни „Вход със Strava“ горе, одобри достъпа и ще се върнеш тук.")
         st.stop()
 
     client = StravaClient(access_token)
@@ -229,6 +239,58 @@ def render_strava():
             st.success("Заредени са последните 10 активности.")
         except Exception as e:
             st.error(f"Грешка при заявка към Strava: {e}")
+
+    acts = st.session_state.get("activities_cache") or []
+    if acts:
+        df_acts = pd.DataFrame([{
+            "id": a["id"],
+            "name": a.get("name"),
+            "type": a.get("type"),
+            "start_date_local": a.get("start_date_local"),
+            "distance_km": round(a.get("distance", 0) / 1000.0, 2),
+            "moving_time_min": int(a.get("moving_time", 0) / 60),
+            "avg_hr": a.get("average_heartrate", None),
+            "avg_speed_kmh": round((a.get("average_speed", 0) or 0) * 3.6, 2),
+        } for a in acts])
+
+        st.dataframe(df_acts, use_container_width=True)
+
+        # запис в Supabase
+        try:
+            n = save_activities_to_db(df_acts)
+            st.success(f"Записани/обновени в Supabase: {n} активности.")
+        except Exception as e:
+            st.warning(f"Записът към Supabase не успя: {e}")
+    else:
+        st.info("Няма кеширани активности. Натисни „Обнови активностите“.")
+
+    # 4) 1 Hz таблица за конкретна активност
+    activity_id = st.text_input("Въведи activity_id за 1 Hz таблица:", placeholder="напр. 1234567890")
+    if st.button("⬇️ Дърпай streams и направи 1 Hz"):
+        if not activity_id.strip().isdigit():
+            st.warning("Моля, въведи валиден activity_id (число).")
+            st.stop()
+        try:
+            streams = client.get_activity_streams(int(activity_id))
+            df_1hz = build_timeseries_1hz(streams)
+            if df_1hz.empty:
+                st.error("Неуспех при генериране на 1 Hz таблица (липсва time stream).")
+                st.stop()
+
+            st.success(f"1 Hz таблица: {len(df_1hz)} реда.")
+            st.dataframe(df_1hz.head(300), use_container_width=True)
+
+            # Download CSV
+            dl = df_1hz.reset_index().rename(columns={"second": "t_sec"})
+            download_csv_button(dl, "💾 Download 1Hz CSV", f"activity_{activity_id}_1hz.csv")
+
+            # Предложения за прагове
+            rec = suggest_thresholds(df_1hz)
+            if rec:
+                st.info(f"Предложени прагове (ориентир): {rec}")
+        except Exception as e:
+            st.error(f"Грешка при дърпане на streams: {e}")
+
 
     acts = st.session_state.get("activities_cache") or []
     if acts:
