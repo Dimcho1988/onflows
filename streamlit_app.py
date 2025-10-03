@@ -361,4 +361,25 @@ elif page == "Настройки":
             CFG["zones"] = zones
             save_config(CFG)
             st.success("Запазено в config.yaml и приложено веднага.")
+# --- Добави този код НАЙ-ОТДОЛУ в streamlit_app.py ---
+
+import streamlit as st
+
+def strava_login_button():
+    client_id = st.secrets["STRAVA_CLIENT_ID"]
+    redirect_uri = st.secrets["APP_REDIRECT_URI"]
+    auth_url = (
+        f"https://www.strava.com/oauth/authorize?client_id={client_id}"
+        f"&response_type=code&redirect_uri={redirect_uri}"
+        f"&scope=activity:read_all,profile:read_all"
+    )
+    st.markdown(f"[🔗 Login with Strava]({auth_url})", unsafe_allow_html=True)
+
+
+# Ако си на Strava страницата – добавяме бутона най-отгоре
+if "Strava" in st.session_state.get("page", "Strava"):
+    st.markdown("---")
+    st.subheader("OAuth Login")
+    strava_login_button()
+    st.markdown("---")
 
