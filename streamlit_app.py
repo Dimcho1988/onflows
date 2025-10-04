@@ -337,6 +337,11 @@ def render_strava():
 
             st.success(f"1 Hz таблица: {len(df_1hz)} реда.")
             st.dataframe(df_1hz.head(300), use_container_width=True)
+from db import upsert_activity_stream
+
+# 👉 запис в Supabase
+n_rows = upsert_activity_stream(int(activity_id), df_1hz)
+st.success(f"Записани са {n_rows} реда в activity_streams (Supabase).")
 
             # Download CSV
             dl = df_1hz.reset_index().rename(columns={"second": "t_sec"})
