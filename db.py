@@ -176,43 +176,52 @@ def _normalize_activity_row(a: dict, fallback_athlete_id: Optional[int]) -> dict
 
 # ---------- Публични функции ----------
 
-def upsert_athlete_and_tokens(strava_athlete_id: int, firstname: str | None, lastname: str | None,
-                              access_token: str, refresh_token: str, expires_at: int, scope: str | None) -> None:
+def upsert_athlete_and_tokens(
+    strava_athlete_id: int,
+    firstname: str | None,
+    lastname: str | None,
+    access_token: str,
+    refresh_token: str,
+    expires_at: int,
+    scope: str | None = None,
+) -> None:
     """
-    1) Upsert в athletes по strava_athlete_id
-    2) Upsert в strava_tokens по athlete_id (= strava_athlete_id или вътр. id – тук ползваме директно strava_athlete_id)
+    Upsert на athlete и tokens.
+    Заб.: НЕ пазим 'scope', защото колоната липсва в таблицата.
     """
     with SessionLocal() as s:
-        # athletes
+        # --- Insert / Update athlete ---
         a_stmt = pg_insert(Athlete.__table__).values({
             "strava_athlete_id": strava_athlete_id,
             "firstname": firstname,
             "lastname": lastname,
         }).on_conflict_do_update(
             index_elements=[Athlete.__table__.c.strava_athlete_id],
-            set_={"firstname": firstname, "lastname": lastname}
+            set_={
+                "firstname": firstname,
+                "lastname": lastname,
+            },
         )
         s.execute(a_stmt)
 
-        # strava_tokens (ползваме ключ athlete_id = STRAVA athlete id, за простота)
+        # --- Insert / Update token ---
         t_stmt = pg_insert(StravaToken.__table__).values({
             "athlete_id": strava_athlete_id,
             "access_token": access_token,
             "refresh_token": refresh_token,
             "expires_at": expires_at,
-            "scope": scope,
         }).on_conflict_do_update(
             index_elements=[StravaToken.__table__.c.athlete_id],
             set_={
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "expires_at": expires_at,
-                "scope": scope,
-                "updated_at": text("timezone('utc', now())")
-            }
+                "updated_at": text("timezone('utc', now())"),
+            },
         )
         s.execute(t_stmt)
         s.commit()
+
 
 
 def upsert_activities(activities: Iterable[dict], *, fallback_athlete_id: Optional[int]) -> int:
