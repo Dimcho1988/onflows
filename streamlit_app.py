@@ -1,516 +1,279 @@
-# =========================
-# streamlit_app.py  — onFlows (цял файл, 1:1)
-# =========================
+# db.py
+from __future__ import annotations
 import os
-import io
-import json
-import yaml
-import time
-import pathlib
-import requests
-import pandas as pd
-import numpy as np
-import streamlit as st
-from datetime import datetime
+from typing import Optional, Iterable
+from datetime import datetime, timezone
 
-# Локални модули (както си ги имаш в репото)
-from strava_streams import StravaClient, build_timeseries_1hz
-from normalize import add_percent_columns
-from indices import compute_tiz, compute_daily_stress, aggregate_daily_stress, compute_acwr, compute_hr_drift
-from calibration import infer_modalities, suggest_thresholds
-from generator import generate_plan
+from sqlalchemy import (
+    create_engine, text, BigInteger, Integer, Float, String, Boolean,
+    DateTime, UniqueConstraint, Index, ForeignKey
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-# -------------------- App setup --------------------
-st.set_page_config(page_title="onFlows MVP", layout="wide")
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
 
 
-# ---------- Config load/save ----------
-def load_config():
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# ---------- Engine / Session ----------
+
+def get_db_url() -> str:
+    url = os.getenv("SUPABASE_DB_URL")
+    if not url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL липсва. Добави го в .env, напр.\n"
+            "SUPABASE_DB_URL=postgresql+psycopg://postgres:YOUR_PASSWORD@.../postgres?sslmode=require"
+        )
+    return url
+
+_engine = create_engine(
+    get_db_url(),
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    future=True,
+)
+
+SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
 
 
-def save_config(cfg):
-    with open("config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+# ---------- ORM модели ----------
+
+class Base(DeclarativeBase):
+    pass
 
 
-CFG = load_config()
+class Activity(Base):
+    __tablename__ = "activities"
 
+    # В onFlows приемаме, че activity_id идва от Strava (bigint).
+    activity_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
-def init_state():
-    d = CFG["defaults"]
-    st.session_state.setdefault("HRmax", d["HRmax"])
-    st.session_state.setdefault("CS_run_kmh", d["CS_run_kmh"])
-    st.session_state.setdefault("CP_bike_w", d["CP_bike_w"])
-    st.session_state.setdefault("strava_token_full", None)   # целият токен обект
-    st.session_state.setdefault("activities_cache", None)
-    st.session_state.setdefault("meta_log", [])              # за дневен стрес / ACWR
+    athlete_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    start_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    elapsed_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    moving_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-init_state()
+    distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_elevation_gain: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    average_speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    average_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    average_cadence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    average_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    device_watts: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
-# ---------- Secrets / OAuth helpers ----------
-def app_redirect_uri():
-    return st.secrets.get("APP_REDIRECT_URI", "http://localhost:8501")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("timezone('utc', now())"),
+        nullable=False,
+    )
 
-
-def strava_oauth_url():
-    client_id = st.secrets.get("STRAVA_CLIENT_ID", "")
-    redirect = app_redirect_uri()
-    scope = "activity:read_all"
-    return (
-        "https://www.strava.com/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&redirect_uri={redirect}"
-        "&response_type=code"
-        f"&scope={scope}"
+    __table_args__ = (
+        # Ако вече имаш PK/индекси — това няма да ги дублира.
+        Index("ix_activities_start_date", "start_date"),
+        Index("ix_activities_athlete_id", "athlete_id"),
     )
 
 
-def exchange_code_for_token(code: str) -> dict:
-    url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": st.secrets["STRAVA_CLIENT_ID"],
-        "client_secret": st.secrets["STRAVA_CLIENT_SECRET"],
-        "code": code,
-        "grant_type": "authorization_code",
-    }
-    r = requests.post(url, data=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
+class ActivityStream(Base):
+    __tablename__ = "activity_streams"
+
+    # Композитен уникален ключ: (activity_id, idx)
+    activity_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("activities.activity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    idx: Mapped[int] = mapped_column(Integer, primary_key=True)  # 0..N при 1 Hz
+
+    time_s: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    altitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cadence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    power: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    temperature: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("ix_streams_activity_id", "activity_id"),
+        Index("ix_streams_time", "activity_id", "time_s"),
+    )
 
 
-# ---------- Token cache & refresh ----------
-TOKEN_PATH = pathlib.Path.home() / ".streamlit" / "onflows_strava_token.json"
+# ---------- Init (по избор, ако искаш автосъздаване) ----------
+
+def init_db(create_missing: bool = True) -> None:
+    """Създава липсващи таблици според моделите (няма да трие/променя съществуващи)."""
+    if create_missing:
+        Base.metadata.create_all(_engine)
 
 
-def save_token_to_disk(token: dict):
-    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(TOKEN_PATH, "w", encoding="utf-8") as f:
-        json.dump(token, f)
+# ---------- Помощници за нормализация ----------
 
-
-def load_token_from_disk() -> dict | None:
-    if TOKEN_PATH.exists():
-        with open(TOKEN_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-def refresh_access_token(refresh_token: str) -> dict:
-    url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": st.secrets["STRAVA_CLIENT_ID"],
-        "client_secret": st.secrets["STRAVA_CLIENT_SECRET"],
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
-    r = requests.post(url, data=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def ensure_strava_token() -> str | None:
-    """
-    Връща валиден access_token. Ползва session_state + локален кеш и авто-рефреш.
-    """
-    tok = st.session_state.get("strava_token_full") or load_token_from_disk()
-    if not tok:
+def _to_aware(dt_str: Optional[str]) -> Optional[datetime]:
+    """ISO8601 -> timezone-aware UTC datetime (ако има вход)."""
+    if not dt_str:
         return None
-    # ако е на път да изтече → освежи
-    if time.time() >= float(tok.get("expires_at", 0)) - 30:
-        try:
-            tok = refresh_access_token(tok["refresh_token"])
-            st.session_state["strava_token_full"] = tok
-            save_token_to_disk(tok)
-        except Exception as e:
-            st.warning(f"Изтекъл токен. Нужно е ново вписване в Strava. ({e})")
-            return None
-    st.session_state["strava_token_full"] = tok
-    save_token_to_disk(tok)
-    return tok["access_token"]
+    # Примери от Strava: "2025-10-01T06:48:33Z"
+    try:
+        if isinstance(dt_str, datetime):
+            return dt_str if dt_str.tzinfo else dt_str.replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
-# ---------- Download helpers ----------
-def download_csv_button(df: pd.DataFrame, label: str, filename: str, key=None):
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(label, data=csv, file_name=filename, mime="text/csv", key=key)
-
-
-def download_excel_button(df: pd.DataFrame, label: str, filename: str, key=None):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        df.to_excel(xw, index=False, sheet_name="Plan")
-    st.download_button(
-        label,
-        data=buf.getvalue(),
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=key,
-    )
-
-
-# =========================
-# Supabase (Postgres) helpers
-# =========================
-import psycopg2
-import psycopg2.extras
-
-
-def _get_conn():
-    return psycopg2.connect(st.secrets["DB_URL"])
-
-
-def _ensure_activities_table():
-    ddl = """
-    CREATE TABLE IF NOT EXISTS activities (
-        id               BIGINT PRIMARY KEY,
-        name             TEXT,
-        type             TEXT,
-        start_date_local TIMESTAMPTZ,
-        distance_km      DOUBLE PRECISION,
-        moving_time_min  DOUBLE PRECISION,
-        avg_hr           DOUBLE PRECISION,
-        avg_speed_kmh    DOUBLE PRECISION,
-        inserted_at      TIMESTAMPTZ DEFAULT NOW()
-    );
-    """
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-        conn.commit()
-
-
-def save_activities_to_db(df: pd.DataFrame) -> int:
-    """
-    Expects df columns:
-      id, name, type, start_date_local, distance_km, moving_time_min, avg_hr, avg_speed_kmh
-    Returns number of rows upserted.
-    """
-    required = [
-        "id",
-        "name",
-        "type",
-        "start_date_local",
-        "distance_km",
-        "moving_time_min",
-        "avg_hr",
-        "avg_speed_kmh",
-    ]
-    rename_map = {
-        "start_date": "start_date_local",
-        "distance": "distance_km",
-        "moving_time": "moving_time_min",
-        "average_heartrate": "avg_hr",
-        "avg_speed": "avg_speed_kmh",
+def _normalize_activity_row(a: dict) -> dict:
+    """Очаква Strava-подобен dict и връща готов ред за таблица `activities`."""
+    return {
+        "activity_id": a.get("id"),
+        "athlete_id": (a.get("athlete") or {}).get("id"),
+        "name": a.get("name"),
+        "type": a.get("sport_type") or a.get("type"),
+        "start_date": _to_aware(a.get("start_date") or a.get("start_date_local")),
+        "elapsed_time": a.get("elapsed_time"),
+        "moving_time": a.get("moving_time"),
+        "distance": a.get("distance"),
+        "total_elevation_gain": a.get("total_elevation_gain"),
+        "average_speed": a.get("average_speed"),
+        "max_speed": a.get("max_speed"),
+        "average_heartrate": a.get("average_heartrate"),
+        "max_heartrate": a.get("max_heartrate"),
+        "average_cadence": a.get("average_cadence"),
+        "average_watts": a.get("average_watts"),
+        "device_watts": a.get("device_watts"),
     }
-    for k, v in rename_map.items():
-        if k in df.columns and v not in df.columns:
-            df = df.rename(columns={k: v})
 
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.warning(f"Липсващи колони в DF за запис: {missing}")
+
+# ---------- Публични функции (това ще ползваш) ----------
+
+def upsert_activities(activities: Iterable[dict]) -> int:
+    """
+    Upsert на списък с активности в `activities`.
+    Връща броя редове, които са вкарани/обновени.
+    """
+    rows = []
+    for a in activities:
+        row = _normalize_activity_row(a)
+        if row.get("activity_id") is None:
+            continue
+        rows.append(row)
+
+    if not rows:
         return 0
 
-    _ensure_activities_table()
-
-    rows = df[required].copy()
-    if rows["start_date_local"].dtype == "object":
-        rows["start_date_local"] = pd.to_datetime(rows["start_date_local"], errors="coerce", utc=True)
-
-    data = [tuple(x) for x in rows.to_numpy()]
-
-    upsert_sql = """
-        INSERT INTO activities
-        (id, name, type, start_date_local, distance_km, moving_time_min, avg_hr, avg_speed_kmh)
-        VALUES %s
-        ON CONFLICT (id) DO UPDATE SET
-            name = EXCLUDED.name,
-            type = EXCLUDED.type,
-            start_date_local = EXCLUDED.start_date_local,
-            distance_km = EXCLUDED.distance_km,
-            moving_time_min = EXCLUDED.moving_time_min,
-            avg_hr = EXCLUDED.avg_hr,
-            avg_speed_kmh = EXCLUDED.avg_speed_kmh;
-    """
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, upsert_sql, data, page_size=500)
-        conn.commit()
-    return len(data)
-
-
-# -------------------- Sidebar / Navigation --------------------
-st.sidebar.title("onFlows")
-page = st.sidebar.radio("Меню", ["Strava", "Индекси", "Генератор", "Настройки"], key="nav_radio")
-
-
-# ============================================================
-# STRAVA PAGE
-# ============================================================
-def render_strava():
-    st.header("Strava – OAuth, активности и 1 Hz таблица")
-
-    # Линк/бутон за вход – показва се ВИНАГИ (удобно за релогване)
-    auth_url = strava_oauth_url()
-    try:
-        st.link_button("🔐 Вход със Strava", auth_url, help="Отвори Strava OAuth", key="oauth_link_btn")
-    except Exception:
-        st.markdown(f"[🔐 Вход със Strava]({auth_url})")
-
-    # Ако се върнем с ?code=... → обменяме за токен
-    params = st.query_params
-    if "code" in params:
-        try:
-            token_data = exchange_code_for_token(params["code"])
-            st.session_state["strava_token_full"] = token_data
-            save_token_to_disk(token_data)
-            st.success("✅ Успешен вход в Strava!")
-            st.query_params.clear()
-        except Exception as e:
-            st.error(f"Грешка при обмен на код за токен: {e}")
-
-    # Осигури валиден токен
-    access_token = ensure_strava_token()
-    if not access_token:
-        st.info("Натисни „Вход със Strava“ горе, одобри достъпа и ще се върнеш тук.")
-        st.stop()
-
-    client = StravaClient(access_token)
-
-    # Обнови активности
-    if st.button("🔄 Обнови активностите (последни 10)", key="btn_refresh_acts"):
-        try:
-            acts = client.get_athlete_activities(per_page=10)
-            st.session_state["activities_cache"] = acts
-            st.success("Заредени са последните 10 активности.")
-        except Exception as e:
-            st.error(f"Грешка при заявка към Strava: {e}")
-
-    acts = st.session_state.get("activities_cache") or []
-    if acts:
-        df_acts = pd.DataFrame(
-            [
-                {
-                    "id": a["id"],
-                    "name": a.get("name"),
-                    "type": a.get("type"),
-                    "start_date_local": a.get("start_date_local"),
-                    "distance_km": round(a.get("distance", 0) / 1000.0, 2),
-                    "moving_time_min": int(a.get("moving_time", 0) / 60),
-                    "avg_hr": a.get("average_heartrate", None),
-                    "avg_speed_kmh": round((a.get("average_speed", 0) or 0) * 3.6, 2),
-                }
-                for a in acts
-            ]
-        )
-        st.dataframe(df_acts, use_container_width=True)
-
-        # запис в Supabase
-        try:
-            n = save_activities_to_db(df_acts)
-            st.success(f"Записани/обновени в Supabase: {n} активности.")
-        except Exception as e:
-            st.warning(f"Записът към Supabase не успя: {e}")
-    else:
-        st.info("Няма кеширани активности. Натисни „Обнови активностите“.")
-
-    # 1 Hz таблица
-    activity_id = st.text_input(
-        "Въведи activity_id за 1 Hz таблица:",
-        placeholder="напр. 1234567890",
-        key="activity_id_input",
+    stmt = pg_insert(Activity.__table__).values(rows)
+    # Ключът е PK activity_id – при конфликт обновяваме последните данни (name, метрики и пр.)
+    update_cols = {c.name: stmt.excluded[c.name]
+                   for c in Activity.__table__.c
+                   if c.name not in ("activity_id", "created_at")}
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[Activity.__table__.c.activity_id],
+        set_=update_cols,
     )
-    if st.button("⬇️ Дърпай streams и направи 1 Hz", key="btn_make_1hz"):
-        if not activity_id.strip().isdigit():
-            st.warning("Моля, въведи валиден activity_id (число).")
-            st.stop()
+
+    with SessionLocal() as s:
+        res = s.execute(stmt)
+        s.commit()
+        return res.rowcount or 0
+
+
+def upsert_activity_streams(
+    activity_id: int,
+    streams: dict,
+    *,
+    hz: int = 1,
+    chunk_size: int = 10_000,
+) -> int:
+    """
+    Upsert на 1 Hz (или друго hz) данни в `activity_streams` за една активност.
+
+    `streams` е dict с ключове по подобие на Strava:
+      - "time": [0,1,2,...] или секунди от старта
+      - "latlng": [[lat, lon], ...]     (по избор)
+      - "altitude", "distance", "velocity_smooth"/"speed",
+        "heart_rate", "cadence", "watts"/"power", "temp"/"temperature"  -> списъци
+
+    Връща общия брой опитани за insert/update редове (не точно „вкарани нови“).
+    """
+    if not activity_id:
+        return 0
+
+    # Взимаме масивите, ако липсват – None
+    t = streams.get("time") or []
+    latlng = streams.get("latlng") or []
+    altitude = streams.get("altitude") or []
+    distance = streams.get("distance") or []
+    speed = streams.get("velocity_smooth") or streams.get("speed") or []
+    hr = streams.get("heartrate") or streams.get("heart_rate") or []
+    cad = streams.get("cadence") or []
+    pwr = streams.get("watts") or streams.get("power") or []
+    tmp = streams.get("temperature") or streams.get("temp") or []
+
+    # Дължина = max по наличните потоци
+    max_len = max(
+        len(t), len(latlng), len(altitude), len(distance),
+        len(speed), len(hr), len(cad), len(pwr), len(tmp)
+    )
+    if max_len == 0:
+        return 0
+
+    def get_or_none(arr, i, sub=None):
         try:
-            streams = client.get_activity_streams(int(activity_id))
-            df_1hz = build_timeseries_1hz(streams)
-            if df_1hz.empty:
-                st.error("Неуспех при генериране на 1 Hz таблица (липсва time stream).")
-                st.stop()
+            v = arr[i]
+            if sub is not None:
+                return v[sub] if v is not None else None
+            return v
+        except Exception:
+            return None
 
-            st.success(f"1 Hz таблица: {len(df_1hz)} реда.")
-            st.dataframe(df_1hz.head(300), use_container_width=True)
-from db import upsert_activity_stream
+    rows = []
+    for i in range(max_len):
+        rows.append({
+            "activity_id": activity_id,
+            "idx": i,                     # секунден индекс при 1 Hz
+            "time_s": get_or_none(t, i),
 
-# 👉 запис в Supabase
-n_rows = upsert_activity_stream(int(activity_id), df_1hz)
-st.success(f"Записани са {n_rows} реда в activity_streams (Supabase).")
+            "lat": get_or_none(latlng, i, 0),
+            "lon": get_or_none(latlng, i, 1),
 
-            # Download CSV
-            dl = df_1hz.reset_index().rename(columns={"second": "t_sec"})
-            download_csv_button(dl, "💾 Download 1Hz CSV", f"activity_{activity_id}_1hz.csv", key="dl_1hz_csv")
+            "altitude": get_or_none(altitude, i),
+            "distance": get_or_none(distance, i),
+            "speed": get_or_none(speed, i),
 
-            # Предложени прагове (ориентир)
-            rec = suggest_thresholds(df_1hz)
-            if rec:
-                st.info(f"Предложени прагове (ориентир): {rec}")
-        except Exception as e:
-            st.error(f"Грешка при дърпане на streams: {e}")
+            "heartrate": get_or_none(hr, i),
+            "cadence": get_or_none(cad, i),
+            "power": get_or_none(pwr, i),
+            "temperature": get_or_none(tmp, i),
+        })
 
-
-# ============================================================
-# INDICES PAGE
-# ============================================================
-def render_indices():
-    st.header("Индекси – TIZ, дневен стрес, ACWR, HR drift")
-
-    uploaded = st.file_uploader("Качи 1 Hz CSV (от 'Strava' страницата)", type=["csv"], key="u_csv")
-    mode = st.selectbox("Режим за TIZ", ["hr", "pct_cs", "pct_cp"], index=0, key="tiz_mode")
-
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        df = df.rename(columns={"t_sec": "second"}).set_index("second")
-
-        zones_cfg = CFG["zones"]
-        df = add_percent_columns(
-            df,
-            cs_run_kmh=float(st.session_state["CS_run_kmh"]),
-            cp_bike_w=float(st.session_state["CP_bike_w"]),
-            hrmax=float(st.session_state["HRmax"]),
-            zones_cfg=zones_cfg,
-        )
-
-        tiz = compute_tiz(df, mode=mode, zones_cfg=zones_cfg)
-        st.subheader("Време в зони (мин)")
-        st.dataframe(tiz.to_frame(name="мин"), use_container_width=True)
-
-        stress = compute_daily_stress(df)
-        st.metric("Стрес (активност)", f"{int(stress)}")
-
-        drift = compute_hr_drift(df)
-        if np.isnan(drift):
-            st.info("HR drift: недостатъчни данни.")
-        else:
-            st.metric("HR drift (decoupling)", f"{drift*100:.1f}%")
-
-        date_str = st.text_input(
-            "Дата на активността (YYYY-MM-DD)",
-            value=datetime.now().strftime("%Y-%m-%d"),
-            key="idx_date_input",
-        )
-        if st.button("➕ Добави активността в дневния стрес", key="btn_add_stress"):
-            st.session_state["meta_log"].append({"date": date_str, "stress": stress})
-            st.success("Добавено. Долу виж ACWR.")
-
-    st.subheader("ACWR (7/28)")
-    if st.session_state["meta_log"]:
-        meta_df = pd.DataFrame(st.session_state["meta_log"])
-        meta_df["date"] = pd.to_datetime(meta_df["date"])
-        series = aggregate_daily_stress(meta_df.assign(date=pd.to_datetime(meta_df["date"])))
-        acwr = compute_acwr(series)
-        if not acwr.empty:
-            latest_date = acwr.index.max()
-            st.metric("Последен ACWR", f"{acwr.loc[latest_date]:.2f}")
-        st.write("Дневен стрес (по дати):")
-        st.dataframe(series.to_frame(name="stress"), use_container_width=True)
-    else:
-        st.info("Добави поне една активност с дата, за да видиш ACWR.")
-
-
-# ============================================================
-# GENERATOR PAGE
-# ============================================================
-def render_generator():
-    st.header("Генератор – седмичен план с адаптация по ACWR")
-
-    latest_acwr = 1.0
-    if st.session_state.get("meta_log"):
-        meta_df = pd.DataFrame(st.session_state["meta_log"])
-        meta_df["date"] = pd.to_datetime(meta_df["date"])
-        series = aggregate_daily_stress(meta_df)
-        acwr = compute_acwr(series)
-        if len(acwr):
-            latest_acwr = float(acwr.iloc[-1])
-
-    st.write(f"Текущ ACWR (ако има данни): **{latest_acwr:.2f}**")
-
-    base_calendar = ["Пон", "Вто", "Сря", "Чет", "Пет", "Съб", "Нед"]
-
-    athlete_state = {
-        "HRmax": float(st.session_state["HRmax"]),
-        "CS_run_kmh": float(st.session_state["CS_run_kmh"]),
-        "CP_bike_w": float(st.session_state["CP_bike_w"]),
-    }
-    indices_ctx = {"acwr_latest": latest_acwr}
-
-    plan = generate_plan(athlete_state, indices_ctx, base_calendar, CFG)
-    st.dataframe(plan, use_container_width=True)
-    download_excel_button(plan, "💾 Download седмичен план (Excel)", "onflows_week_plan.xlsx", key="dl_plan_xlsx")
-
-
-# ============================================================
-# SETTINGS PAGE (editable + save)
-# ============================================================
-def render_settings():
-    st.header("Настройки – HRmax / CS / CP и зони (редакция)")
-
-    with st.form("settings_form"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            hrmax_val = st.number_input(
-                "HRmax (bpm)", min_value=120, max_value=230, value=int(st.session_state["HRmax"])
+    total = 0
+    # Upsert на парчета за големи активности
+    with SessionLocal() as s:
+        for j in range(0, len(rows), chunk_size):
+            chunk = rows[j:j + chunk_size]
+            stmt = pg_insert(ActivityStream.__table__).values(chunk)
+            # При конфликт на (activity_id, idx) -> не правим нищо (данните не би трябвало да се променят)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=[ActivityStream.__table__.c.activity_id,
+                                ActivityStream.__table__.c.idx]
             )
-        with col2:
-            cs_val = st.number_input(
-                "CS (бягане) km/h", min_value=8.0, max_value=26.0, value=float(st.session_state["CS_run_kmh"]), step=0.1
-            )
-        with col3:
-            cp_val = st.number_input(
-                "CP (колоездене) W", min_value=80, max_value=500, value=int(st.session_state["CP_bike_w"])
-            )
-
-        st.markdown("### Редакция на зони")
-        zones = CFG["zones"].copy()
-        # къмпактно обхождане на зони
-        for metric_key, zones_dict in zones.items():
-            with st.expander(f"Зони за: {metric_key}", expanded=False):
-                for z_name, bounds in zones_dict.items():
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        lo = st.number_input(
-                            f"{metric_key}.{z_name} – долна граница",
-                            key=f"{metric_key}_{z_name}_lo",
-                            value=float(bounds[0]),
-                            step=0.01,
-                            format="%.2f",
-                        )
-                    with c2:
-                        hi = st.number_input(
-                            f"{metric_key}.{z_name} – горна граница",
-                            key=f"{metric_key}_{z_name}_hi",
-                            value=float(bounds[1]),
-                            step=0.01,
-                            format="%.2f",
-                        )
-                    zones[metric_key][z_name] = [float(lo), float(hi)]
-
-        submitted = st.form_submit_button("💾 Запази конфигурацията")
-        if submitted:
-            st.session_state["HRmax"] = hrmax_val
-            st.session_state["CS_run_kmh"] = cs_val
-            st.session_state["CP_bike_w"] = cp_val
-
-            CFG["defaults"]["HRmax"] = hrmax_val
-            CFG["defaults"]["CS_run_kmh"] = cs_val
-            CFG["defaults"]["CP_bike_w"] = cp_val
-            CFG["zones"] = zones
-            save_config(CFG)
-            st.success("Запазено в config.yaml и приложено веднага.")
-
-
-# -------------------- Main router --------------------
-if page == "Strava":
-    render_strava()
-elif page == "Индекси":
-    render_indices()
-elif page == "Генератор":
-    render_generator()
-else:
-    render_settings()
+            res = s.execute(stmt)
+            total += res.rowcount or 0
+        s.commit()
+    return total
