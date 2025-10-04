@@ -233,3 +233,36 @@ def upsert_daily_stress(athlete_id: int, day, stress: float):
         with conn.cursor() as cur:
             cur.execute(sql, (athlete_id, day, stress))
             conn.commit()
+def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
+    """
+    Записва 1 Hz stream данни за дадена активност в Supabase.
+    Очаква df с индекс second и колони: lat, lon, altitude, heartrate, cadence, watts, velocity_smooth.
+    Връща броя записани редове.
+    """
+    sql = """
+        INSERT INTO activity_streams
+        (activity_id, second, lat, lon, altitude, heartrate, cadence, power, speed)
+        VALUES %s
+        ON CONFLICT DO NOTHING;
+    """
+
+    rows = []
+    for sec, row in df.iterrows():
+        rows.append((
+            activity_id,
+            int(sec),
+            row.get("lat"),
+            row.get("lon"),
+            row.get("altitude"),
+            row.get("heartrate"),
+            row.get("cadence"),
+            row.get("watts"),
+            row.get("velocity_smooth"),
+        ))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
+        conn.commit()
+
+    return len(rows)
