@@ -5,3 +5,7 @@ numpy
 openpyxl
 psycopg2-binary
 pyyaml
+streamlit>=1.37
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+python-dotenv>=1.0
