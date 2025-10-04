@@ -190,4 +190,19 @@ if st.button("Синхронизирай"):
 
         # 2) По желание – стриймове (chunk upsert вътре в db.py)
         if with_streams:
-            pb = st.pro
+            pb = st.progress(0.0, text="Запис на стриймове…")
+            for i, a in enumerate(acts, start=1):
+                try:
+                    streams = get_activity_streams(access_token, a["id"])
+                    # Strava връща по ключ; подаваме директно на upsert_activity_streams
+                    count = upsert_activity_streams(a["id"], streams, hz=1, chunk_size=10_000)
+                    st.write(f"• {a.get('name')} → редове: {count}")
+                except Exception as e:
+                    st.warning(f"Проблем със стриймовете за activity {a.get('id')}: {e}")
+                pb.progress(i / len(acts))
+            pb.empty()
+
+        st.success("Готово. Данните са в Supabase.")
+    except Exception as e:
+        st.error(f"Грешка при синхронизация: {e}")
+
