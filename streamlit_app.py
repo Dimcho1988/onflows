@@ -5,11 +5,12 @@ from datetime import datetime, timezone, timedelta
 import requests
 import streamlit as st
 
+# === 1) Глобален store за OAuth state (фиксира "Invalid state") ===
 @st.cache_resource
 def _oauth_state_store():
     return set()
 
-# Secrets → env за db.py
+# === 2) Secrets → env за db.py ==============================================
 if "SUPABASE_DB_URL" in st.secrets:
     os.environ.setdefault("SUPABASE_DB_URL", st.secrets["SUPABASE_DB_URL"])
 
@@ -20,6 +21,7 @@ if not (STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET and STRAVA_REDIRECT_URI):
     st.error("Липсват STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET / STRAVA_REDIRECT_URI в Secrets.")
     st.stop()
 
+# === 3) Импорт на БД слой ====================================================
 from db import (
     init_db,
     upsert_athlete_and_tokens,
@@ -32,9 +34,11 @@ try:
 except Exception as e:
     st.error(f"Грешка при init_db(): {e}")
 
+# === 4) Strava OAuth + API ===================================================
 AUTH_BASE = "https://www.strava.com/oauth/authorize"
 TOKEN_URL = "https://www.strava.com/oauth/token"
 API_BASE = "https://www.strava.com/api/v3"
+
 
 def oauth_login_url() -> str:
     store = _oauth_state_store()
@@ -50,6 +54,7 @@ def oauth_login_url() -> str:
         "state": state,
     }
     return f"{AUTH_BASE}?{urllib.parse.urlencode(params)}"
+
 
 def exchange_code_for_token(code: str) -> dict:
     data = {
@@ -67,8 +72,8 @@ def exchange_code_for_token(code: str) -> dict:
         "expires_at": int(tok["expires_at"]),
         "expires_at_dt": datetime.fromtimestamp(tok["expires_at"], tz=timezone.utc),
         "athlete": tok.get("athlete", {}),
-        "scope": tok.get("scope"),
     }
+
 
 def refresh_access_token(refresh_token: str) -> dict:
     data = {
@@ -85,11 +90,12 @@ def refresh_access_token(refresh_token: str) -> dict:
         "refresh_token": tok["refresh_token"],
         "expires_at": int(tok["expires_at"]),
         "expires_at_dt": datetime.fromtimestamp(tok["expires_at"], tz=timezone.utc),
-        "scope": tok.get("scope"),
     }
+
 
 def _auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
 
 def get_athlete_activities(access_token: str, after_ts: int | None = None, per_page: int = 100):
     params = {"per_page": per_page, "page": 1}
@@ -107,6 +113,7 @@ def get_athlete_activities(access_token: str, after_ts: int | None = None, per_p
         params["page"] += 1
     return out
 
+
 def get_activity_streams(access_token: str, activity_id: int) -> dict:
     params = {
         "keys": "time,latlng,altitude,distance,velocity_smooth,heartrate,cadence,watts,temperature",
@@ -120,11 +127,11 @@ def get_activity_streams(access_token: str, activity_id: int) -> dict:
     r.raise_for_status()
     return r.json()
 
-# ---------------- UI ----------------
+# === 5) UI ===================================================================
 st.set_page_config(page_title="onFlows – Strava → Supabase", page_icon="🏃")
 st.title("onFlows – Strava → Supabase")
 
-# OAuth callback
+# === 6) OAuth callback =======================================================
 params = st.query_params
 if "code" in params and "state" in params:
     code = params.get("code")
@@ -133,8 +140,10 @@ if "code" in params and "state" in params:
     store = _oauth_state_store()
     state_ok = st.session_state.get("oauth_state") == state or state in store
     if state in store:
-        try: store.remove(state)
-        except KeyError: pass
+        try:
+            store.remove(state)
+        except KeyError:
+            pass
 
     if state_ok:
         try:
@@ -144,7 +153,7 @@ if "code" in params and "state" in params:
             st.session_state["expires_at"] = tok["expires_at_dt"]
             st.session_state["athlete"] = tok["athlete"]
 
-            # upsert в athletes + tokens
+            # upsert в athletes + tokens (без 'scope')
             a = tok["athlete"] or {}
             upsert_athlete_and_tokens(
                 strava_athlete_id=a.get("id"),
@@ -153,7 +162,6 @@ if "code" in params and "state" in params:
                 access_token=tok["access_token"],
                 refresh_token=tok["refresh_token"],
                 expires_at=tok["expires_at"],
-                scope=tok.get("scope"),
             )
             st.success("Свързване със Strava: ОК ✅")
         except Exception as e:
@@ -164,21 +172,21 @@ if "code" in params and "state" in params:
         st.error("Невалидно OAuth състояние (state). Опитай пак.")
         st.query_params.clear()
 
-# login state
+# === 7) Проверка за вход =====================================================
 if "access_token" not in st.session_state:
     st.write("Впиши се със Strava, за да синхронизираш активностите си към Supabase.")
     if st.button("Вход със Strava"):
         st.link_button("Продължи към Strava", oauth_login_url())
     st.stop()
 
-# refresh if needed
+# === 8) Проверка за изтекъл токен ===========================================
 if datetime.now(timezone.utc) > st.session_state["expires_at"]:
     try:
         rt = refresh_access_token(st.session_state["refresh_token"])
         st.session_state["access_token"] = rt["access_token"]
         st.session_state["refresh_token"] = rt["refresh_token"]
         st.session_state["expires_at"] = rt["expires_at_dt"]
-        # токените в таблица
+        # обнови токените и в БД (без 'scope')
         a = st.session_state.get("athlete", {}) or {}
         upsert_athlete_and_tokens(
             strava_athlete_id=a.get("id"),
@@ -187,12 +195,12 @@ if datetime.now(timezone.utc) > st.session_state["expires_at"]:
             access_token=rt["access_token"],
             refresh_token=rt["refresh_token"],
             expires_at=rt["expires_at"],
-            scope=rt.get("scope"),
         )
     except Exception as e:
         st.error(f"Неуспешно опресняване на токена: {e}")
         st.stop()
 
+# === 9) UI контроли ==========================================================
 athlete = st.session_state.get("athlete", {}) or {}
 athlete_id = athlete.get("id")
 st.info(f"Атлет: {athlete.get('firstname','')} {athlete.get('lastname','')}  •  ID: {athlete_id}")
@@ -203,6 +211,7 @@ with col1:
 with col2:
     with_streams = st.checkbox("Записвай 1 Hz стриймове", value=True)
 
+# === 10) Синхронизация =======================================================
 if st.button("Синхронизирай"):
     access_token = st.session_state["access_token"]
     after_ts = int(datetime.now(timezone.utc).timestamp() - days * 86400) if days > 0 else None
@@ -211,7 +220,7 @@ if st.button("Синхронизирай"):
         acts = get_athlete_activities(access_token, after_ts=after_ts)
         st.write(f"Намерени активности: **{len(acts)}**")
 
-        # попълни athlete_id за всеки ред (списъкът от Strava няма това поле)
+        # Добавяме athlete_id (списъкът на Strava не го съдържа)
         for a in acts:
             a["athlete"] = {"id": athlete_id}
 
@@ -233,6 +242,7 @@ if st.button("Синхронизирай"):
         st.success("Готово. Данните са в Supabase.")
     except Exception as e:
         st.error(f"Грешка при синхронизация: {e}")
+
 
 
 
