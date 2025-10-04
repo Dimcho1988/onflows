@@ -1,30 +1,41 @@
-# db.py
 import os
 from contextlib import contextmanager
+from typing import Optional
+import pandas as pd
+import psycopg2
+import psycopg2.extras as pgx
 
+# Streamlit може да не е наличен при локално стартиране
 try:
     import streamlit as st
     _HAS_ST = True
 except Exception:
     _HAS_ST = False
 
-import psycopg2
-import psycopg2.extras as pgx
-
 
 def _get_secret(key: str, default: str = None) -> str:
+    """Взима променлива от Streamlit secrets или от системната среда."""
     if _HAS_ST and "secrets" in dir(st) and key in st.secrets:
         return st.secrets[key]
     return os.getenv(key, default)
 
 
+# Връзка към Supabase Postgres
 DB_URL = _get_secret("DB_URL")
 if not DB_URL:
     raise RuntimeError("DB_URL not found in secrets or environment!")
 
+# Задължително sslmode=require за Supabase
+if "sslmode" not in DB_URL:
+    if "?" in DB_URL:
+        DB_URL += "&sslmode=require"
+    else:
+        DB_URL += "?sslmode=require"
+
 
 @contextmanager
 def get_conn():
+    """Контекстен мениджър за връзка с Postgres."""
     conn = psycopg2.connect(DB_URL)
     try:
         yield conn
@@ -33,7 +44,7 @@ def get_conn():
 
 
 def upsert_athlete(strava_athlete_id: int, firstname: str = None, lastname: str = None) -> int:
-    """Returns internal athlete id."""
+    """Вмъква или обновява атлет по Strava ID. Връща вътрешен athlete_id."""
     sql = """
     INSERT INTO athletes (strava_athlete_id, firstname, lastname)
     VALUES (%s, %s, %s)
@@ -51,6 +62,7 @@ def upsert_athlete(strava_athlete_id: int, firstname: str = None, lastname: str 
 
 
 def upsert_token(athlete_id: int, access_token: str, refresh_token: str, expires_at: int, scope: str = None):
+    """Записва или обновява Strava токените за атлета."""
     sql = """
     INSERT INTO strava_tokens (athlete_id, access_token, refresh_token, expires_at, scope)
     VALUES (%s, %s, %s, %s, %s)
@@ -68,7 +80,7 @@ def upsert_token(athlete_id: int, access_token: str, refresh_token: str, expires
 
 
 def get_all_tokens():
-    """Return list of dicts {athlete_id, access_token, refresh_token, expires_at}."""
+    """Връща всички токени като list от dict."""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=pgx.RealDictCursor) as cur:
             cur.execute("SELECT * FROM strava_tokens;")
@@ -76,17 +88,18 @@ def get_all_tokens():
 
 
 def last_activity_start(athlete_id: int):
+    """Намира последната дата на активност за даден атлет."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(start_date) FROM activities WHERE athlete_id=%s;", (athlete_id,))
             row = cur.fetchone()
-            return row[0]  # may be None
+            return row[0] if row else None
 
 
 def upsert_activity(activity: dict, athlete_id: int):
     """
-    Expects minimal Strava activity fields + precomputed values:
-    id, name, type, start_date, distance, moving_time, average_heartrate, average_speed
+    Вмъква или обновява активност.
+    Очаква полета: id, name, type, start_date, distance, moving_time, average_heartrate, average_speed.
     """
     sql = """
     INSERT INTO activities (
@@ -110,7 +123,7 @@ def upsert_activity(activity: dict, athlete_id: int):
         "athlete_id": athlete_id,
         "name": activity.get("name"),
         "type": activity.get("type"),
-        "start_date": activity.get("start_date"),  # aware timestamp
+        "start_date": activity.get("start_date"),
         "distance_m": activity.get("distance", 0.0),
         "moving_time_s": activity.get("moving_time", 0),
         "avg_hr": activity.get("average_heartrate"),
@@ -121,12 +134,17 @@ def upsert_activity(activity: dict, athlete_id: int):
         with conn.cursor() as cur:
             cur.execute(sql, rec)
             conn.commit()
+
+
 def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
     """
     Записва 1 Hz stream данни за дадена активност.
-    Очаква df с индекс second и колони: lat, lon, altitude, heartrate, cadence, watts, velocity_smooth.
+    Очаква df с индекс 'second' и колони: lat, lon, altitude, heartrate, cadence, watts, velocity_smooth.
     Връща броя записани редове.
     """
+    if df is None or df.empty:
+        return 0
+
     sql = """
         INSERT INTO activity_streams
         (activity_id, second, lat, lon, altitude, heartrate, cadence, power, speed)
@@ -137,7 +155,7 @@ def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
     rows = []
     for sec, row in df.iterrows():
         rows.append((
-            activity_id,
+            int(activity_id),
             int(sec),
             row.get("lat"),
             row.get("lon"),
@@ -150,46 +168,14 @@ def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
-        conn.commit()
-
-    return len(rows)
-def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
-    """
-    Записва 1 Hz stream данни за дадена активност.
-    Очаква df с индекс second и колони: lat, lon, altitude, heartrate, cadence, watts, velocity_smooth.
-    Връща броя записани редове.
-    """
-    sql = """
-        INSERT INTO activity_streams
-        (activity_id, second, lat, lon, altitude, heartrate, cadence, power, speed)
-        VALUES %s
-        ON CONFLICT DO NOTHING;
-    """
-
-    rows = []
-    for sec, row in df.iterrows():
-        rows.append((
-            activity_id,
-            int(sec),
-            row.get("lat"),
-            row.get("lon"),
-            row.get("altitude"),
-            row.get("heartrate"),
-            row.get("cadence"),
-            row.get("watts"),
-            row.get("velocity_smooth"),
-        ))
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
+            pgx.execute_values(cur, sql, rows, page_size=1000)
         conn.commit()
 
     return len(rows)
 
 
-def upsert_metrics(activity_id: int, tiz_minutes: dict, stress: float, hr_drift: float | None):
+def upsert_metrics(activity_id: int, tiz_minutes: dict, stress: float, hr_drift: Optional[float]):
+    """Вмъква или обновява тренировъчните метрики за дадена активност."""
     sql = """
     INSERT INTO activity_metrics (
         activity_id,
@@ -223,6 +209,7 @@ def upsert_metrics(activity_id: int, tiz_minutes: dict, stress: float, hr_drift:
 
 
 def upsert_daily_stress(athlete_id: int, day, stress: float):
+    """Обновява дневния тренировъчен стрес."""
     sql = """
     INSERT INTO daily_stress (athlete_id, day, stress)
     VALUES (%s, %s, %s)
@@ -233,36 +220,4 @@ def upsert_daily_stress(athlete_id: int, day, stress: float):
         with conn.cursor() as cur:
             cur.execute(sql, (athlete_id, day, stress))
             conn.commit()
-def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
-    """
-    Записва 1 Hz stream данни за дадена активност в Supabase.
-    Очаква df с индекс second и колони: lat, lon, altitude, heartrate, cadence, watts, velocity_smooth.
-    Връща броя записани редове.
-    """
-    sql = """
-        INSERT INTO activity_streams
-        (activity_id, second, lat, lon, altitude, heartrate, cadence, power, speed)
-        VALUES %s
-        ON CONFLICT DO NOTHING;
-    """
 
-    rows = []
-    for sec, row in df.iterrows():
-        rows.append((
-            activity_id,
-            int(sec),
-            row.get("lat"),
-            row.get("lon"),
-            row.get("altitude"),
-            row.get("heartrate"),
-            row.get("cadence"),
-            row.get("watts"),
-            row.get("velocity_smooth"),
-        ))
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
-        conn.commit()
-
-    return len(rows)
