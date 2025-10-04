@@ -1,223 +1,282 @@
+from __future__ import annotations
 import os
-from contextlib import contextmanager
-from typing import Optional
-import pandas as pd
-import psycopg2
-import psycopg2.extras as pgx
+from typing import Optional, Iterable
+from datetime import datetime, timezone
 
-# Streamlit може да не е наличен при локално стартиране
+from sqlalchemy import (
+    create_engine, text, BigInteger, Integer, Float, String, Boolean,
+    DateTime, Index, ForeignKey
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+# --- Зареждане на .env (ако се стартира локално) ---
 try:
-    import streamlit as st
-    _HAS_ST = True
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
 except Exception:
-    _HAS_ST = False
+    pass
 
 
-def _get_secret(key: str, default: str = None) -> str:
-    """Взима променлива от Streamlit secrets или от системната среда."""
-    if _HAS_ST and "secrets" in dir(st) and key in st.secrets:
-        return st.secrets[key]
-    return os.getenv(key, default)
+# ---------- Engine / Session ----------
 
-
-# Връзка към Supabase Postgres
-DB_URL = _get_secret("DB_URL")
-if not DB_URL:
-    raise RuntimeError("DB_URL not found in secrets or environment!")
-
-# Задължително sslmode=require за Supabase
-if "sslmode" not in DB_URL:
-    if "?" in DB_URL:
-        DB_URL += "&sslmode=require"
-    else:
-        DB_URL += "?sslmode=require"
-
-
-@contextmanager
-def get_conn():
-    """Контекстен мениджър за връзка с Postgres."""
-    conn = psycopg2.connect(DB_URL)
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-def upsert_athlete(strava_athlete_id: int, firstname: str = None, lastname: str = None) -> int:
-    """Вмъква или обновява атлет по Strava ID. Връща вътрешен athlete_id."""
-    sql = """
-    INSERT INTO athletes (strava_athlete_id, firstname, lastname)
-    VALUES (%s, %s, %s)
-    ON CONFLICT (strava_athlete_id) DO UPDATE
-      SET firstname = EXCLUDED.firstname,
-          lastname  = EXCLUDED.lastname
-    RETURNING id;
+def get_db_url() -> str:
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (strava_athlete_id, firstname, lastname))
-            rid = cur.fetchone()[0]
-            conn.commit()
-            return rid
-
-
-def upsert_token(athlete_id: int, access_token: str, refresh_token: str, expires_at: int, scope: str = None):
-    """Записва или обновява Strava токените за атлета."""
-    sql = """
-    INSERT INTO strava_tokens (athlete_id, access_token, refresh_token, expires_at, scope)
-    VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT (athlete_id) DO UPDATE
-       SET access_token = EXCLUDED.access_token,
-           refresh_token = EXCLUDED.refresh_token,
-           expires_at = EXCLUDED.expires_at,
-           scope = COALESCE(EXCLUDED.scope, strava_tokens.scope),
-           updated_at = NOW();
+    Връща връзката към Supabase Postgres.
+    Поддържа psycopg2 драйвер (съвместим с requirements.txt).
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (athlete_id, access_token, refresh_token, expires_at, scope))
-            conn.commit()
+    url = os.getenv("SUPABASE_DB_URL")
+    if not url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL липсва. Добави го в .env, напр.\n"
+            "SUPABASE_DB_URL=postgresql+psycopg2://postgres:YOUR_PASSWORD@aws-1-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require"
+        )
+
+    # Ако някой е въвел psycopg вместо psycopg2, коригирай автоматично
+    if url.startswith("postgresql+psycopg://"):
+        url = url.replace("postgresql+psycopg://", "postgresql+psycopg2://", 1)
+
+    # Увери се, че има sslmode=require
+    if "sslmode" not in url:
+        if "?" in url:
+            url += "&sslmode=require"
+        else:
+            url += "?sslmode=require"
+
+    return url
 
 
-def get_all_tokens():
-    """Връща всички токени като list от dict."""
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=pgx.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM strava_tokens;")
-            return list(cur.fetchall())
+# Създаваме SQLAlchemy engine
+_engine = create_engine(
+    get_db_url(),
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    future=True,
+)
+
+SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
 
 
-def last_activity_start(athlete_id: int):
-    """Намира последната дата на активност за даден атлет."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT MAX(start_date) FROM activities WHERE athlete_id=%s;", (athlete_id,))
-            row = cur.fetchone()
-            return row[0] if row else None
+# ---------- ORM модели ----------
+
+class Base(DeclarativeBase):
+    """Базов клас за всички ORM модели"""
+    pass
 
 
-def upsert_activity(activity: dict, athlete_id: int):
-    """
-    Вмъква или обновява активност.
-    Очаква полета: id, name, type, start_date, distance, moving_time, average_heartrate, average_speed.
-    """
-    sql = """
-    INSERT INTO activities (
-        id, athlete_id, name, type, start_date,
-        distance_m, moving_time_s, avg_hr, avg_speed_mps, raw
+class Activity(Base):
+    __tablename__ = "activities"
+
+    # Strava activity ID
+    activity_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+    athlete_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    start_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    elapsed_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    moving_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_elevation_gain: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    average_speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    average_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    average_cadence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    average_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    device_watts: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("timezone('utc', now())"),
+        nullable=False,
     )
-    VALUES (%(id)s, %(athlete_id)s, %(name)s, %(type)s, %(start_date)s,
-            %(distance_m)s, %(moving_time_s)s, %(avg_hr)s, %(avg_speed_mps)s, %(raw)s)
-    ON CONFLICT (id) DO UPDATE
-      SET name = EXCLUDED.name,
-          type = EXCLUDED.type,
-          start_date = EXCLUDED.start_date,
-          distance_m = EXCLUDED.distance_m,
-          moving_time_s = EXCLUDED.moving_time_s,
-          avg_hr = EXCLUDED.avg_hr,
-          avg_speed_mps = EXCLUDED.avg_speed_mps,
-          raw = EXCLUDED.raw;
-    """
-    rec = {
-        "id": activity["id"],
-        "athlete_id": athlete_id,
-        "name": activity.get("name"),
-        "type": activity.get("type"),
-        "start_date": activity.get("start_date"),
-        "distance_m": activity.get("distance", 0.0),
-        "moving_time_s": activity.get("moving_time", 0),
-        "avg_hr": activity.get("average_heartrate"),
-        "avg_speed_mps": activity.get("average_speed"),
-        "raw": pgx.Json(activity),
+
+    __table_args__ = (
+        Index("ix_activities_start_date", "start_date"),
+        Index("ix_activities_athlete_id", "athlete_id"),
+    )
+
+
+class ActivityStream(Base):
+    __tablename__ = "activity_streams"
+
+    # Композитен ключ (activity_id, idx)
+    activity_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("activities.activity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    idx: Mapped[int] = mapped_column(Integer, primary_key=True)  # секунден индекс (0..N)
+
+    time_s: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    altitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cadence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    power: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    temperature: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("ix_streams_activity_id", "activity_id"),
+        Index("ix_streams_time", "activity_id", "time_s"),
+    )
+
+
+# ---------- Init ----------
+
+def init_db(create_missing: bool = True) -> None:
+    """Създава липсващи таблици, без да трие съществуващи."""
+    if create_missing:
+        Base.metadata.create_all(_engine)
+
+
+# ---------- Помощни функции ----------
+
+def _to_aware(dt_str: Optional[str]) -> Optional[datetime]:
+    """Конвертира ISO8601 дата (Strava формат) към timezone-aware UTC datetime."""
+    if not dt_str:
+        return None
+    try:
+        if isinstance(dt_str, datetime):
+            return dt_str if dt_str.tzinfo else dt_str.replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _normalize_activity_row(a: dict) -> dict:
+    """Превежда Strava dict към формат за таблица `activities`."""
+    return {
+        "activity_id": a.get("id"),
+        "athlete_id": (a.get("athlete") or {}).get("id"),
+        "name": a.get("name"),
+        "type": a.get("sport_type") or a.get("type"),
+        "start_date": _to_aware(a.get("start_date") or a.get("start_date_local")),
+        "elapsed_time": a.get("elapsed_time"),
+        "moving_time": a.get("moving_time"),
+        "distance": a.get("distance"),
+        "total_elevation_gain": a.get("total_elevation_gain"),
+        "average_speed": a.get("average_speed"),
+        "max_speed": a.get("max_speed"),
+        "average_heartrate": a.get("average_heartrate"),
+        "max_heartrate": a.get("max_heartrate"),
+        "average_cadence": a.get("average_cadence"),
+        "average_watts": a.get("average_watts"),
+        "device_watts": a.get("device_watts"),
     }
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, rec)
-            conn.commit()
 
 
-def upsert_activity_stream(activity_id: int, df: pd.DataFrame) -> int:
+# ---------- Публични функции ----------
+
+def upsert_activities(activities: Iterable[dict]) -> int:
     """
-    Записва 1 Hz stream данни за дадена активност.
-    Очаква df с индекс 'second' и колони: lat, lon, altitude, heartrate, cadence, watts, velocity_smooth.
-    Връща броя записани редове.
+    Upsert на списък с активности в таблица `activities`.
+    Връща броя редове, които са добавени/обновени.
     """
-    if df is None or df.empty:
+    rows = []
+    for a in activities:
+        row = _normalize_activity_row(a)
+        if row.get("activity_id") is None:
+            continue
+        rows.append(row)
+
+    if not rows:
         return 0
 
-    sql = """
-        INSERT INTO activity_streams
-        (activity_id, second, lat, lon, altitude, heartrate, cadence, power, speed)
-        VALUES %s
-        ON CONFLICT DO NOTHING;
+    stmt = pg_insert(Activity.__table__).values(rows)
+    update_cols = {
+        c.name: stmt.excluded[c.name]
+        for c in Activity.__table__.c
+        if c.name not in ("activity_id", "created_at")
+    }
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[Activity.__table__.c.activity_id],
+        set_=update_cols,
+    )
+
+    with SessionLocal() as s:
+        res = s.execute(stmt)
+        s.commit()
+        return res.rowcount or 0
+
+
+def upsert_activity_streams(
+    activity_id: int,
+    streams: dict,
+    *,
+    hz: int = 1,
+    chunk_size: int = 10_000,
+) -> int:
     """
+    Upsert на 1Hz стриймове (или друга честота) в `activity_streams`.
+    """
+    if not activity_id:
+        return 0
+
+    t = streams.get("time") or []
+    latlng = streams.get("latlng") or []
+    altitude = streams.get("altitude") or []
+    distance = streams.get("distance") or []
+    speed = streams.get("velocity_smooth") or streams.get("speed") or []
+    hr = streams.get("heartrate") or streams.get("heart_rate") or []
+    cad = streams.get("cadence") or []
+    pwr = streams.get("watts") or streams.get("power") or []
+    tmp = streams.get("temperature") or streams.get("temp") or []
+
+    max_len = max(
+        len(t), len(latlng), len(altitude), len(distance),
+        len(speed), len(hr), len(cad), len(pwr), len(tmp)
+    )
+    if max_len == 0:
+        return 0
+
+    def get_or_none(arr, i, sub=None):
+        try:
+            v = arr[i]
+            if sub is not None:
+                return v[sub] if v is not None else None
+            return v
+        except Exception:
+            return None
 
     rows = []
-    for sec, row in df.iterrows():
-        rows.append((
-            int(activity_id),
-            int(sec),
-            row.get("lat"),
-            row.get("lon"),
-            row.get("altitude"),
-            row.get("heartrate"),
-            row.get("cadence"),
-            row.get("watts"),
-            row.get("velocity_smooth"),
-        ))
+    for i in range(max_len):
+        rows.append({
+            "activity_id": activity_id,
+            "idx": i,
+            "time_s": get_or_none(t, i),
+            "lat": get_or_none(latlng, i, 0),
+            "lon": get_or_none(latlng, i, 1),
+            "altitude": get_or_none(altitude, i),
+            "distance": get_or_none(distance, i),
+            "speed": get_or_none(speed, i),
+            "heartrate": get_or_none(hr, i),
+            "cadence": get_or_none(cad, i),
+            "power": get_or_none(pwr, i),
+            "temperature": get_or_none(tmp, i),
+        })
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            pgx.execute_values(cur, sql, rows, page_size=1000)
-        conn.commit()
-
-    return len(rows)
-
-
-def upsert_metrics(activity_id: int, tiz_minutes: dict, stress: float, hr_drift: Optional[float]):
-    """Вмъква или обновява тренировъчните метрики за дадена активност."""
-    sql = """
-    INSERT INTO activity_metrics (
-        activity_id,
-        tiz_z1_minutes, tiz_z2_minutes, tiz_z3_minutes, tiz_z4_minutes, tiz_z5_minutes,
-        stress, hr_drift
-    )
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (activity_id) DO UPDATE
-      SET tiz_z1_minutes=EXCLUDED.tiz_z1_minutes,
-          tiz_z2_minutes=EXCLUDED.tiz_z2_minutes,
-          tiz_z3_minutes=EXCLUDED.tiz_z3_minutes,
-          tiz_z4_minutes=EXCLUDED.tiz_z4_minutes,
-          tiz_z5_minutes=EXCLUDED.tiz_z5_minutes,
-          stress=EXCLUDED.stress,
-          hr_drift=EXCLUDED.hr_drift,
-          computed_at = NOW();
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (
-                activity_id,
-                tiz_minutes.get("Z1", 0.0),
-                tiz_minutes.get("Z2", 0.0),
-                tiz_minutes.get("Z3", 0.0),
-                tiz_minutes.get("Z4", 0.0),
-                tiz_minutes.get("Z5", 0.0),
-                stress,
-                hr_drift,
-            ))
-            conn.commit()
-
-
-def upsert_daily_stress(athlete_id: int, day, stress: float):
-    """Обновява дневния тренировъчен стрес."""
-    sql = """
-    INSERT INTO daily_stress (athlete_id, day, stress)
-    VALUES (%s, %s, %s)
-    ON CONFLICT (athlete_id, day) DO UPDATE
-      SET stress = EXCLUDED.stress;
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (athlete_id, day, stress))
-            conn.commit()
+    total = 0
+    with SessionLocal() as s:
+        for j in range(0, len(rows), chunk_size):
+            chunk = rows[j:j + chunk_size]
+            stmt = pg_insert(ActivityStream.__table__).values(chunk)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=[
+                    ActivityStream.__table__.c.activity_id,
+                    ActivityStream.__table__.c.idx
+                ]
+            )
+            res = s.execute(stmt)
+            total += res.rowcount or 0
+        s.commit()
+    return total
 
