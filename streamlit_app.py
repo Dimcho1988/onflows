@@ -1,279 +1,193 @@
-# db.py
-from __future__ import annotations
 import os
-from typing import Optional, Iterable
-from datetime import datetime, timezone
+import secrets
+import urllib.parse
+from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import (
-    create_engine, text, BigInteger, Integer, Float, String, Boolean,
-    DateTime, UniqueConstraint, Index, ForeignKey
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+import requests
+import streamlit as st
 
+# === 1) СЕКРЕТИ / ОКОЛНА СРЕДА ==============================================
+# Увери се, че имаме SUPABASE_DB_URL като env, защото db.py го чете от os.getenv
+if "SUPABASE_DB_URL" in st.secrets:
+    os.environ.setdefault("SUPABASE_DB_URL", st.secrets["SUPABASE_DB_URL"])
+
+STRAVA_CLIENT_ID = st.secrets.get("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = st.secrets.get("STRAVA_CLIENT_SECRET")
+STRAVA_REDIRECT_URI = st.secrets.get("STRAVA_REDIRECT_URI")  # напр. https://onflows.streamlit.app
+if not (STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET and STRAVA_REDIRECT_URI):
+    st.error("Липсват STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET / STRAVA_REDIRECT_URI в Secrets.")
+    st.stop()
+
+# === 2) ИМПОРТ НА БАЗАТА (след като сме сетнали SUPABASE_DB_URL) ============
+from db import init_db, upsert_activities, upsert_activity_streams  # noqa: E402
+
+# Автосъздаване на липсващи таблици (не трие нищо)
 try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except Exception:
-    pass
+    init_db(create_missing=True)
+except Exception as e:
+    st.error(f"Грешка при init_db(): {e}")
+
+# === 3) STRAVA OAUTH + API ===================================================
+AUTH_BASE = "https://www.strava.com/oauth/authorize"
+TOKEN_URL = "https://www.strava.com/oauth/token"
+API_BASE = "https://www.strava.com/api/v3"
 
 
-# ---------- Engine / Session ----------
-
-def get_db_url() -> str:
-    url = os.getenv("SUPABASE_DB_URL")
-    if not url:
-        raise RuntimeError(
-            "SUPABASE_DB_URL липсва. Добави го в .env, напр.\n"
-            "SUPABASE_DB_URL=postgresql+psycopg://postgres:YOUR_PASSWORD@.../postgres?sslmode=require"
-        )
-    return url
-
-_engine = create_engine(
-    get_db_url(),
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    future=True,
-)
-
-SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+def oauth_login_url() -> str:
+    state = secrets.token_urlsafe(16)
+    st.session_state["oauth_state"] = state
+    params = {
+        "client_id": STRAVA_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": STRAVA_REDIRECT_URI,
+        "approval_prompt": "auto",
+        "scope": "read,activity:read_all",
+        "state": state,
+    }
+    return f"{AUTH_BASE}?{urllib.parse.urlencode(params)}"
 
 
-# ---------- ORM модели ----------
-
-class Base(DeclarativeBase):
-    pass
-
-
-class Activity(Base):
-    __tablename__ = "activities"
-
-    # В onFlows приемаме, че activity_id идва от Strava (bigint).
-    activity_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-
-    athlete_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-
-    start_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    elapsed_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    moving_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-
-    distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    total_elevation_gain: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    average_speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    max_speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-
-    average_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    max_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    average_cadence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    average_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    device_watts: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text("timezone('utc', now())"),
-        nullable=False,
-    )
-
-    __table_args__ = (
-        # Ако вече имаш PK/индекси — това няма да ги дублира.
-        Index("ix_activities_start_date", "start_date"),
-        Index("ix_activities_athlete_id", "athlete_id"),
-    )
-
-
-class ActivityStream(Base):
-    __tablename__ = "activity_streams"
-
-    # Композитен уникален ключ: (activity_id, idx)
-    activity_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("activities.activity_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    idx: Mapped[int] = mapped_column(Integer, primary_key=True)  # 0..N при 1 Hz
-
-    time_s: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-
-    lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-
-    altitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    speed: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-
-    heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    cadence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    power: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    temperature: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-
-    __table_args__ = (
-        Index("ix_streams_activity_id", "activity_id"),
-        Index("ix_streams_time", "activity_id", "time_s"),
-    )
-
-
-# ---------- Init (по избор, ако искаш автосъздаване) ----------
-
-def init_db(create_missing: bool = True) -> None:
-    """Създава липсващи таблици според моделите (няма да трие/променя съществуващи)."""
-    if create_missing:
-        Base.metadata.create_all(_engine)
-
-
-# ---------- Помощници за нормализация ----------
-
-def _to_aware(dt_str: Optional[str]) -> Optional[datetime]:
-    """ISO8601 -> timezone-aware UTC datetime (ако има вход)."""
-    if not dt_str:
-        return None
-    # Примери от Strava: "2025-10-01T06:48:33Z"
-    try:
-        if isinstance(dt_str, datetime):
-            return dt_str if dt_str.tzinfo else dt_str.replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def _normalize_activity_row(a: dict) -> dict:
-    """Очаква Strava-подобен dict и връща готов ред за таблица `activities`."""
+def exchange_code_for_token(code: str) -> dict:
+    data = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+    r = requests.post(TOKEN_URL, data=data, timeout=30)
+    r.raise_for_status()
+    tok = r.json()
     return {
-        "activity_id": a.get("id"),
-        "athlete_id": (a.get("athlete") or {}).get("id"),
-        "name": a.get("name"),
-        "type": a.get("sport_type") or a.get("type"),
-        "start_date": _to_aware(a.get("start_date") or a.get("start_date_local")),
-        "elapsed_time": a.get("elapsed_time"),
-        "moving_time": a.get("moving_time"),
-        "distance": a.get("distance"),
-        "total_elevation_gain": a.get("total_elevation_gain"),
-        "average_speed": a.get("average_speed"),
-        "max_speed": a.get("max_speed"),
-        "average_heartrate": a.get("average_heartrate"),
-        "max_heartrate": a.get("max_heartrate"),
-        "average_cadence": a.get("average_cadence"),
-        "average_watts": a.get("average_watts"),
-        "device_watts": a.get("device_watts"),
+        "access_token": tok["access_token"],
+        "refresh_token": tok["refresh_token"],
+        "expires_at": datetime.fromtimestamp(tok["expires_at"], tz=timezone.utc),
+        "athlete": tok.get("athlete", {}),
     }
 
 
-# ---------- Публични функции (това ще ползваш) ----------
-
-def upsert_activities(activities: Iterable[dict]) -> int:
-    """
-    Upsert на списък с активности в `activities`.
-    Връща броя редове, които са вкарани/обновени.
-    """
-    rows = []
-    for a in activities:
-        row = _normalize_activity_row(a)
-        if row.get("activity_id") is None:
-            continue
-        rows.append(row)
-
-    if not rows:
-        return 0
-
-    stmt = pg_insert(Activity.__table__).values(rows)
-    # Ключът е PK activity_id – при конфликт обновяваме последните данни (name, метрики и пр.)
-    update_cols = {c.name: stmt.excluded[c.name]
-                   for c in Activity.__table__.c
-                   if c.name not in ("activity_id", "created_at")}
-    stmt = stmt.on_conflict_do_update(
-        index_elements=[Activity.__table__.c.activity_id],
-        set_=update_cols,
-    )
-
-    with SessionLocal() as s:
-        res = s.execute(stmt)
-        s.commit()
-        return res.rowcount or 0
+def refresh_access_token(refresh_token: str) -> dict:
+    data = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    r = requests.post(TOKEN_URL, data=data, timeout=30)
+    r.raise_for_status()
+    tok = r.json()
+    return {
+        "access_token": tok["access_token"],
+        "refresh_token": tok["refresh_token"],
+        "expires_at": datetime.fromtimestamp(tok["expires_at"], tz=timezone.utc),
+    }
 
 
-def upsert_activity_streams(
-    activity_id: int,
-    streams: dict,
-    *,
-    hz: int = 1,
-    chunk_size: int = 10_000,
-) -> int:
-    """
-    Upsert на 1 Hz (или друго hz) данни в `activity_streams` за една активност.
+def _auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
-    `streams` е dict с ключове по подобие на Strava:
-      - "time": [0,1,2,...] или секунди от старта
-      - "latlng": [[lat, lon], ...]     (по избор)
-      - "altitude", "distance", "velocity_smooth"/"speed",
-        "heart_rate", "cadence", "watts"/"power", "temp"/"temperature"  -> списъци
 
-    Връща общия брой опитани за insert/update редове (не точно „вкарани нови“).
-    """
-    if not activity_id:
-        return 0
+def get_athlete_activities(access_token: str, after_ts: int | None = None, per_page: int = 100):
+    params = {"per_page": per_page, "page": 1}
+    if after_ts:
+        params["after"] = after_ts
+    out = []
+    while True:
+        r = requests.get(f"{API_BASE}/athlete/activities", headers=_auth_headers(access_token),
+                         params=params, timeout=45)
+        r.raise_for_status()
+        batch = r.json()
+        out.extend(batch)
+        if len(batch) < per_page:
+            break
+        params["page"] += 1
+    return out
 
-    # Взимаме масивите, ако липсват – None
-    t = streams.get("time") or []
-    latlng = streams.get("latlng") or []
-    altitude = streams.get("altitude") or []
-    distance = streams.get("distance") or []
-    speed = streams.get("velocity_smooth") or streams.get("speed") or []
-    hr = streams.get("heartrate") or streams.get("heart_rate") or []
-    cad = streams.get("cadence") or []
-    pwr = streams.get("watts") or streams.get("power") or []
-    tmp = streams.get("temperature") or streams.get("temp") or []
 
-    # Дължина = max по наличните потоци
-    max_len = max(
-        len(t), len(latlng), len(altitude), len(distance),
-        len(speed), len(hr), len(cad), len(pwr), len(tmp)
-    )
-    if max_len == 0:
-        return 0
+def get_activity_streams(access_token: str, activity_id: int) -> dict:
+    # high resolution ~ 1 Hz, key_by_type=true => лесно мапване
+    params = {
+        "keys": "time,latlng,altitude,distance,velocity_smooth,heartrate,cadence,watts,temperature",
+        "key_by_type": "true",
+        "resolution": "high",
+    }
+    r = requests.get(f"{API_BASE}/activities/{activity_id}/streams",
+                     headers=_auth_headers(access_token), params=params, timeout=60)
+    if r.status_code == 404:
+        return {}
+    r.raise_for_status()
+    return r.json()
 
-    def get_or_none(arr, i, sub=None):
+
+# === 4) UI ===================================================================
+st.set_page_config(page_title="onFlows – Strava → Supabase", page_icon="🏃")
+st.title("onFlows – Strava → Supabase")
+
+# Обработка на OAuth callback (?code=...&state=...)
+params = st.query_params
+if "code" in params and "state" in params:
+    code = params.get("code")
+    state = params.get("state")
+    if st.session_state.get("oauth_state") and st.session_state["oauth_state"] == state:
         try:
-            v = arr[i]
-            if sub is not None:
-                return v[sub] if v is not None else None
-            return v
-        except Exception:
-            return None
+            tok = exchange_code_for_token(code)
+            st.session_state["access_token"] = tok["access_token"]
+            st.session_state["refresh_token"] = tok["refresh_token"]
+            st.session_state["expires_at"] = tok["expires_at"]
+            st.session_state["athlete"] = tok["athlete"]
+            st.success("Свързване със Strava: ОК ✅")
+        except Exception as e:
+            st.error(f"Грешка при обмен на code → token: {e}")
+        finally:
+            # чист URL без параметри
+            st.query_params.clear()
+    else:
+        st.error("Невалидно OAuth състояние (state). Опитай пак.")
+        st.query_params.clear()
 
-    rows = []
-    for i in range(max_len):
-        rows.append({
-            "activity_id": activity_id,
-            "idx": i,                     # секунден индекс при 1 Hz
-            "time_s": get_or_none(t, i),
+# Статус на сесията
+logged_in = "access_token" in st.session_state
 
-            "lat": get_or_none(latlng, i, 0),
-            "lon": get_or_none(latlng, i, 1),
+if not logged_in:
+    st.write("Впиши се със Strava, за да синхронизираш активностите си към Supabase.")
+    if st.button("Вход със Strava"):
+        st.link_button("Продължи към Strava", oauth_login_url())
+    st.stop()
 
-            "altitude": get_or_none(altitude, i),
-            "distance": get_or_none(distance, i),
-            "speed": get_or_none(speed, i),
+# Рефреш токен ако е изтекъл
+if datetime.now(timezone.utc) > st.session_state["expires_at"]:
+    try:
+        rt = refresh_access_token(st.session_state["refresh_token"])
+        st.session_state["access_token"] = rt["access_token"]
+        st.session_state["refresh_token"] = rt["refresh_token"]
+        st.session_state["expires_at"] = rt["expires_at"]
+    except Exception as e:
+        st.error(f"Неуспешно опресняване на токена: {e}")
+        st.stop()
 
-            "heartrate": get_or_none(hr, i),
-            "cadence": get_or_none(cad, i),
-            "power": get_or_none(pwr, i),
-            "temperature": get_or_none(tmp, i),
-        })
+athlete = st.session_state.get("athlete", {})
+athlete_id = athlete.get("id")
+st.info(f"Атлет: {athlete.get('firstname','')} {athlete.get('lastname','')}  •  ID: {athlete_id}")
 
-    total = 0
-    # Upsert на парчета за големи активности
-    with SessionLocal() as s:
-        for j in range(0, len(rows), chunk_size):
-            chunk = rows[j:j + chunk_size]
-            stmt = pg_insert(ActivityStream.__table__).values(chunk)
-            # При конфликт на (activity_id, idx) -> не правим нищо (данните не би трябвало да се променят)
-            stmt = stmt.on_conflict_do_nothing(
-                index_elements=[ActivityStream.__table__.c.activity_id,
-                                ActivityStream.__table__.c.idx]
-            )
-            res = s.execute(stmt)
-            total += res.rowcount or 0
-        s.commit()
-    return total
+col1, col2 = st.columns(2)
+with col1:
+    days = st.number_input("Изтегли последните (дни)", min_value=0, max_value=3650, value=30, step=1)
+with col2:
+    with_streams = st.checkbox("Записвай 1 Hz стриймове", value=True)
+
+if st.button("Синхронизирай"):
+    access_token = st.session_state["access_token"]
+    after_ts = None
+    if days > 0:
+        after_ts = int(datetime.now(timezone.utc).timestamp() - days * 86400)
+
+    try:
+        acts = get_athlete_activities(access_token, after_ts=after_ts)
+        st.write(f"Намерени активности: **{len(acts)}**")
+
+        # 1) Upsert активности (ORM в db.py ще нормализира форматите)
+        inserted = upsert_activities(acts)
+        st.success(f"Обновени/вкарани активности: {inserted}")
+
+        # 2) По желание – стриймове (chunk upsert вътре в db.py)
+        if with_streams:
+            pb = st.pro
