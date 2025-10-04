@@ -2,40 +2,46 @@ import os
 import secrets
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-
 import requests
 import streamlit as st
 
-# === 1) СЕКРЕТИ / ОКОЛНА СРЕДА ==============================================
-# Увери се, че имаме SUPABASE_DB_URL като env, защото db.py го чете от os.getenv
+# === 1) Глобален store за OAuth state (решава "Невалидно състояние") ===
+@st.cache_resource
+def _oauth_state_store():
+    return set()
+
+# === 2) СЕКРЕТИ / ОКОЛНА СРЕДА ==============================================
 if "SUPABASE_DB_URL" in st.secrets:
     os.environ.setdefault("SUPABASE_DB_URL", st.secrets["SUPABASE_DB_URL"])
 
 STRAVA_CLIENT_ID = st.secrets.get("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = st.secrets.get("STRAVA_CLIENT_SECRET")
-STRAVA_REDIRECT_URI = st.secrets.get("STRAVA_REDIRECT_URI")  # напр. https://onflows.streamlit.app
+STRAVA_REDIRECT_URI = st.secrets.get("STRAVA_REDIRECT_URI")
+
 if not (STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET and STRAVA_REDIRECT_URI):
     st.error("Липсват STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET / STRAVA_REDIRECT_URI в Secrets.")
     st.stop()
 
-# === 2) ИМПОРТ НА БАЗАТА (след като сме сетнали SUPABASE_DB_URL) ============
-from db import init_db, upsert_activities, upsert_activity_streams  # noqa: E402
+# === 3) Импорт на базата =====================================================
+from db import init_db, upsert_activities, upsert_activity_streams
 
-# Автосъздаване на липсващи таблици (не трие нищо)
 try:
     init_db(create_missing=True)
 except Exception as e:
     st.error(f"Грешка при init_db(): {e}")
 
-# === 3) STRAVA OAUTH + API ===================================================
+# === 4) STRAVA OAUTH + API ===================================================
 AUTH_BASE = "https://www.strava.com/oauth/authorize"
 TOKEN_URL = "https://www.strava.com/oauth/token"
 API_BASE = "https://www.strava.com/api/v3"
 
 
 def oauth_login_url() -> str:
+    store = _oauth_state_store()
     state = secrets.token_urlsafe(16)
     st.session_state["oauth_state"] = state
+    store.add(state)
+
     params = {
         "client_id": STRAVA_CLIENT_ID,
         "response_type": "code",
@@ -104,7 +110,6 @@ def get_athlete_activities(access_token: str, after_ts: int | None = None, per_p
 
 
 def get_activity_streams(access_token: str, activity_id: int) -> dict:
-    # high resolution ~ 1 Hz, key_by_type=true => лесно мапване
     params = {
         "keys": "time,latlng,altitude,distance,velocity_smooth,heartrate,cadence,watts,temperature",
         "key_by_type": "true",
@@ -117,17 +122,27 @@ def get_activity_streams(access_token: str, activity_id: int) -> dict:
     r.raise_for_status()
     return r.json()
 
-
-# === 4) UI ===================================================================
+# === 5) UI ===================================================================
 st.set_page_config(page_title="onFlows – Strava → Supabase", page_icon="🏃")
 st.title("onFlows – Strava → Supabase")
 
-# Обработка на OAuth callback (?code=...&state=...)
+# === 6) Обработка на OAuth callback ==========================================
 params = st.query_params
 if "code" in params and "state" in params:
     code = params.get("code")
     state = params.get("state")
-    if st.session_state.get("oauth_state") and st.session_state["oauth_state"] == state:
+
+    store = _oauth_state_store()
+    state_ok = False
+    if st.session_state.get("oauth_state") == state or state in store:
+        state_ok = True
+        if state in store:
+            try:
+                store.remove(state)
+            except KeyError:
+                pass
+
+    if state_ok:
         try:
             tok = exchange_code_for_token(code)
             st.session_state["access_token"] = tok["access_token"]
@@ -138,13 +153,12 @@ if "code" in params and "state" in params:
         except Exception as e:
             st.error(f"Грешка при обмен на code → token: {e}")
         finally:
-            # чист URL без параметри
             st.query_params.clear()
     else:
         st.error("Невалидно OAuth състояние (state). Опитай пак.")
         st.query_params.clear()
 
-# Статус на сесията
+# === 7) Проверка за вход =====================================================
 logged_in = "access_token" in st.session_state
 
 if not logged_in:
@@ -153,7 +167,7 @@ if not logged_in:
         st.link_button("Продължи към Strava", oauth_login_url())
     st.stop()
 
-# Рефреш токен ако е изтекъл
+# === 8) Проверка за изтекъл токен ===========================================
 if datetime.now(timezone.utc) > st.session_state["expires_at"]:
     try:
         rt = refresh_access_token(st.session_state["refresh_token"])
@@ -168,12 +182,14 @@ athlete = st.session_state.get("athlete", {})
 athlete_id = athlete.get("id")
 st.info(f"Атлет: {athlete.get('firstname','')} {athlete.get('lastname','')}  •  ID: {athlete_id}")
 
+# === 9) Настройки за синхронизация ==========================================
 col1, col2 = st.columns(2)
 with col1:
     days = st.number_input("Изтегли последните (дни)", min_value=0, max_value=3650, value=30, step=1)
 with col2:
     with_streams = st.checkbox("Записвай 1 Hz стриймове", value=True)
 
+# === 10) Изпълнение на синхронизация ========================================
 if st.button("Синхронизирай"):
     access_token = st.session_state["access_token"]
     after_ts = None
@@ -184,17 +200,14 @@ if st.button("Синхронизирай"):
         acts = get_athlete_activities(access_token, after_ts=after_ts)
         st.write(f"Намерени активности: **{len(acts)}**")
 
-        # 1) Upsert активности (ORM в db.py ще нормализира форматите)
         inserted = upsert_activities(acts)
         st.success(f"Обновени/вкарани активности: {inserted}")
 
-        # 2) По желание – стриймове (chunk upsert вътре в db.py)
         if with_streams:
             pb = st.progress(0.0, text="Запис на стриймове…")
             for i, a in enumerate(acts, start=1):
                 try:
                     streams = get_activity_streams(access_token, a["id"])
-                    # Strava връща по ключ; подаваме директно на upsert_activity_streams
                     count = upsert_activity_streams(a["id"], streams, hz=1, chunk_size=10_000)
                     st.write(f"• {a.get('name')} → редове: {count}")
                 except Exception as e:
@@ -205,4 +218,5 @@ if st.button("Синхронизирай"):
         st.success("Готово. Данните са в Supabase.")
     except Exception as e:
         st.error(f"Грешка при синхронизация: {e}")
+
 
