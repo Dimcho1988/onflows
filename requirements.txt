@@ -1,0 +1,17 @@
+streamlit>=1.32.0
+pandas>=2.1.0
+numpy>=1.26.0
+altair>=5.2.0
+requests>=2.31.0
+
+supabase-py>=2.4.0
+python-dateutil>=2.8.2
+
+# необходими за XML парсване и TCX обработка
+lxml>=4.9.3
+
+# полезно за работа с дата/час
+pytz>=2023.3
+
+# оптимално за scientific maths
+scipy>=1.11.4
