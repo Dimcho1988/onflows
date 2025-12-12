@@ -170,11 +170,18 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "max_heartrate": act.get("max_heartrate"),
     }
 
+   try:
     res = (
         supabase.table("activities")
         .upsert(row, on_conflict="strava_activity_id")
         .execute()
     )
+except Exception as e:
+    # показва реалния PostgREST error в App logs
+    print("UPSERT activities FAILED. Row keys:", list(row.keys()))
+    print("UPSERT activities FAILED. Row:", row)
+    raise
+
 
     if not res.data:
         return None
