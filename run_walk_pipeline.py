@@ -210,10 +210,17 @@ def clean_speed_for_cs(g: pd.DataFrame, v_max_cs=30.0) -> np.ndarray:
 
 
 def process_run_walk_activity(
-    act_row: dict, streams: dict,
+    act_row: dict,
+    streams: dict,
     alpha_slope: float,
-    V_crit: float, CS: float,
-    tau_min: float, k_par: float, q_par: float, gamma_cs: float
+    V_crit: float,
+    CS: float,
+    tau_min: float,
+    k_par: float,
+    q_par: float,
+    gamma_cs: float,
+    slope_poly_override=None,  # NEW: rolling regression
+    **kwargs,                  # NEW: future-proof (avoid TypeError)
 ) -> pd.DataFrame:
     points = build_points_from_streams(act_row, streams)
     seg = build_segments_30s(points, activity_id=act_row["id"])
@@ -221,16 +228,19 @@ def process_run_walk_activity(
         return seg
 
     seg = apply_basic_filters(seg)
-    V0 = compute_global_flat_speed(seg)
-    slope_train = get_slope_training_data(seg, V0)
-    slope_poly = fit_slope_poly(slope_train)
+
+    slope_poly = slope_poly_override
+    if slope_poly is None:
+        V0 = compute_global_flat_speed(seg)
+        slope_train = get_slope_training_data(seg, V0)
+        slope_poly = fit_slope_poly(slope_train)
 
     seg["v_flat_eq"] = seg["v_kmh_raw"]
     if slope_poly is not None:
         F_vals = compute_slope_F(seg["slope_pct"].values, slope_poly, alpha_slope)
         v_flat_eq = seg["v_kmh_raw"].values * F_vals
 
-        # Run/walk: cap only (not equalize)
+        # Run/walk: cap on strong downhills (< -5%)
         if V_crit and V_crit > 0:
             idx_below = seg["slope_pct"] < -5.0
             v_flat_eq[idx_below] = np.minimum(v_flat_eq[idx_below], 0.8 * V_crit)
@@ -256,7 +266,6 @@ def process_run_walk_activity(
     seg["r_kmh"] = out_cs["r"]
     seg["tau_s"] = out_cs["tau_s"]
 
-    # run/walk doesn't use glide but keep columns for DB compatibility
     seg["k_glide"] = 1.0
     seg["v_glide"] = seg["v_kmh_raw"]
 
