@@ -134,29 +134,23 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
 
 
 # -------------------------------------------------
-# Incremental sync helper (SAFE)
+# Incremental sync helper
 # -------------------------------------------------
 def get_last_activity_start_date(user_id: int):
-    try:
-        res = (
-            supabase.table("activities")
-            .select("start_date")
-            .eq("user_id", user_id)
-            .order("start_date", desc=True)
-            .limit(1)
-            .execute()
-        )
+    res = (
+        supabase.table("activities")
+        .select("start_date")
+        .eq("user_id", user_id)
+        .order("start_date", desc=True)
+        .limit(1)
+        .execute()
+    )
 
-        data = res.data or []
-        if not data:
-            return None
-
-        return datetime.fromisoformat(
-            data[0]["start_date"].replace("Z", "+00:00")
-        )
-
-    except Exception:
+    data = res.data or []
+    if not data:
         return None
+
+    return datetime.fromisoformat(data[0]["start_date"].replace("Z", "+00:00"))
 
 
 # -------------------------------------------------
@@ -202,10 +196,17 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
 
 
 # -------------------------------------------------
-# Supabase: UPSERT 30s segments (IDEMPOTENT)
+# Supabase: UPSERT segments (IDEMPOTENT)
 # -------------------------------------------------
-def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df) -> int:
-    if seg_df is None or seg_df.empty:
+def insert_segments_30s(
+    user_id: int,
+    sport_group: str,
+    activity_id: int,
+    seg_df,
+    segment_seconds: int,
+    model_key: str,
+) -> int:
+    if seg_df is None or getattr(seg_df, "empty", False):
         return 0
 
     wanted = [
@@ -214,6 +215,7 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
         "k_glide", "v_glide",
         "v_flat_eq", "v_flat_eq_cs",
         "delta_v_plus_kmh", "r_kmh", "tau_s", "hr_mean",
+        "zone",
     ]
 
     df = seg_df.copy()
@@ -225,28 +227,26 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
     df["user_id"] = user_id
     df["sport_group"] = sport_group
     df["activity_id"] = activity_id
+    df["segment_seconds"] = segment_seconds
+    df["model_key"] = model_key
 
-    # JSON-safe timestamps
     for col in ["t_start", "t_end"]:
-        if col in df.columns:
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
-            )
+        df[col] = df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else x)
 
     df = df.replace({np.nan: None})
 
-    rows = df[["user_id", "sport_group", "activity_id"] + wanted].to_dict(
-        orient="records"
-    )
+    rows = df[
+        ["user_id", "sport_group", "activity_id",
+         "segment_seconds", "model_key"] + wanted
+    ].to_dict(orient="records")
 
     total = 0
     for i in range(0, len(rows), 1000):
-        chunk = rows[i:i + 1000]
         supabase.table("activity_segments").upsert(
-            chunk,
-            on_conflict="activity_id,sport_group,seg_idx"
+            rows[i:i + 1000],
+            on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
         ).execute()
-        total += len(chunk)
+        total += min(1000, len(rows) - i)
 
     return total
 
@@ -290,31 +290,35 @@ def sync_and_process_from_strava(
         if sport_group is None:
             continue
 
-        new_acts += 1
-
         streams = fetch_activity_streams(access_token, act["id"])
         streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
+
+        params = params_by_sport[sport_group]
+        model_key = params["model_key"]
 
         if sport_group == "ski":
             seg30 = process_ski_activity_30s(
                 act_row={"id": local_activity_id, "start_date": act.get("start_date")},
                 streams=streams_norm,
-                **params_by_sport["ski"],
+                **params,
             )
-            total_segments += insert_segments_30s(
-                athlete_id, "ski", local_activity_id, seg30
-            )
-
-        elif sport_group in ("run", "walk"):
+        else:
             seg30 = process_run_walk_activity(
                 act_row={"id": local_activity_id, "start_date": act.get("start_date")},
                 streams=streams_norm,
-                **params_by_sport["run"],
-            )
-            total_segments += insert_segments_30s(
-                athlete_id, sport_group, local_activity_id, seg30
+                **params,
             )
 
+        total_segments += insert_segments_30s(
+            user_id=athlete_id,
+            sport_group=sport_group,
+            activity_id=local_activity_id,
+            seg_df=seg30,
+            segment_seconds=30,
+            model_key=model_key,
+        )
+
+        new_acts += 1
         time.sleep(0.25)
 
     return new_acts, total_segments
