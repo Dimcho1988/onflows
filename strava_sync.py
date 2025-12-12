@@ -137,10 +137,6 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
 # Incremental sync helper (SAFE)
 # -------------------------------------------------
 def get_last_activity_start_date(user_id: int):
-    """
-    Returns datetime of the latest activity start_date for this user,
-    or None if table is empty or any error occurs.
-    """
     try:
         res = (
             supabase.table("activities")
@@ -155,7 +151,6 @@ def get_last_activity_start_date(user_id: int):
         if not data:
             return None
 
-        # Supabase returns ISO string
         return datetime.fromisoformat(
             data[0]["start_date"].replace("Z", "+00:00")
         )
@@ -191,7 +186,6 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "max_heartrate": act.get("max_heartrate"),
     }
 
-    # remove None values
     row = {k: v for k, v in row.items() if v is not None}
 
     res = (
@@ -208,7 +202,7 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
 
 
 # -------------------------------------------------
-# Supabase: insert 30s segments (JSON-safe)
+# Supabase: UPSERT 30s segments (IDEMPOTENT)
 # -------------------------------------------------
 def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df) -> int:
     if seg_df is None or seg_df.empty:
@@ -248,7 +242,10 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
     total = 0
     for i in range(0, len(rows), 1000):
         chunk = rows[i:i + 1000]
-        supabase.table("activity_segments").insert(chunk).execute()
+        supabase.table("activity_segments").upsert(
+            chunk,
+            on_conflict="activity_id,sport_group,seg_idx"
+        ).execute()
         total += len(chunk)
 
     return total
