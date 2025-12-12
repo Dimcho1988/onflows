@@ -2,6 +2,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import streamlit as st
 from supabase import create_client, Client
 
 # ----------------------------
@@ -15,20 +16,22 @@ STRAVA_CLIENT_SECRET: str | None = None
 supabase: Client | None = None
 
 
-def init_clients(st) -> None:
+# ----------------------------
+# Init clients from Streamlit secrets
+# ----------------------------
+def init_clients(st_app) -> None:
     """
-    Initialize Strava + Supabase clients from Streamlit secrets.
-    Required secrets:
+    Required Streamlit secrets:
       [strava] client_id, client_secret
       [supabase] url, service_role_key
     """
     global SUPABASE_URL, SUPABASE_KEY, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, supabase
 
-    STRAVA_CLIENT_ID = st.secrets["strava"]["client_id"]
-    STRAVA_CLIENT_SECRET = st.secrets["strava"]["client_secret"]
+    STRAVA_CLIENT_ID = st_app.secrets["strava"]["client_id"]
+    STRAVA_CLIENT_SECRET = st_app.secrets["strava"]["client_secret"]
 
-    SUPABASE_URL = st.secrets["supabase"]["url"]
-    SUPABASE_KEY = st.secrets["supabase"]["service_role_key"]
+    SUPABASE_URL = st_app.secrets["supabase"]["url"]
+    SUPABASE_KEY = st_app.secrets["supabase"]["service_role_key"]
 
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -37,11 +40,7 @@ def init_clients(st) -> None:
 # OAuth helpers
 # ----------------------------
 def exchange_code_for_tokens(auth_code: str) -> dict:
-    """
-    Exchange authorization code for tokens and also fetch athlete profile.
-    """
     token_url = "https://www.strava.com/oauth/token"
-
     data = {
         "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
@@ -59,13 +58,13 @@ def exchange_code_for_tokens(auth_code: str) -> dict:
         timeout=20,
     )
     athlete_resp.raise_for_status()
+
     token_info["athlete"] = athlete_resp.json()
     return token_info
 
 
 def get_strava_access_token(refresh_token: str) -> str:
     token_url = "https://www.strava.com/oauth/token"
-
     data = {
         "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
@@ -94,10 +93,8 @@ def fetch_activities_since(access_token: str, after_ts: int) -> list[dict]:
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         chunk = r.json()
-
         if not chunk:
             break
-
         all_activities.extend(chunk)
         page += 1
 
@@ -132,7 +129,7 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
 
 
 # ----------------------------
-# TEMP: bypass last_dt (we sync by days_back)
+# TEMP: bypass last_dt (sync by days_back)
 # ----------------------------
 def get_last_activity_start_date(_user_id: int):
     return None
@@ -143,13 +140,12 @@ def get_last_activity_start_date(_user_id: int):
 # ----------------------------
 def upsert_activity_summary(act: dict, user_id: int) -> int | None:
     """
-    Inserts/updates a row in public.activities.
-    Returns local activities.id or None (if skipped).
+    Upserts into public.activities and returns local activities.id,
+    or None if skipped.
     """
     sport_group = map_sport_group(act.get("sport_type"))
     if sport_group is None:
-        # skip sports outside ski/run/walk
-        return None
+        return None  # skip sports outside ski/run/walk
 
     row = {
         "user_id": user_id,
@@ -170,7 +166,7 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "max_heartrate": act.get("max_heartrate"),
     }
 
-    # Remove None fields to avoid NOT NULL issues (if any)
+    # remove None fields (helps if DB has NOT NULL constraints)
     row = {k: v for k, v in row.items() if v is not None}
 
     try:
@@ -179,10 +175,12 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
             .upsert(row, on_conflict="strava_activity_id")
             .execute()
         )
-    except Exception:
-        # Print details to App logs for debugging
-        print("UPSERT activities FAILED")
-        print("Row:", row)
+    except Exception as e:
+        # ✅ IMPORTANT: show real PostgREST error
+        st.error("UPSERT activities FAILED (raw error):")
+        st.write(e)
+        st.write("Row keys:", list(row.keys()))
+        st.write("Row:", row)
         raise
 
     data = res.data or []
@@ -221,7 +219,13 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
     total = 0
     for i in range(0, len(rows), 1000):
         chunk = rows[i:i + 1000]
-        supabase.table("activity_segments").insert(chunk).execute()
+        try:
+            supabase.table("activity_segments").insert(chunk).execute()
+        except Exception as e:
+            st.error("INSERT activity_segments FAILED (raw error):")
+            st.write(e)
+            st.write("First row example:", chunk[0] if chunk else None)
+            raise
         total += len(chunk)
 
     return total
@@ -287,3 +291,4 @@ def sync_and_process_from_strava(
         time.sleep(0.25)
 
     return new_acts, total_segments
+
