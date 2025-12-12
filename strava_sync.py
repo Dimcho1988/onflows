@@ -3,29 +3,27 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
+import numpy as np
 from supabase import create_client, Client
 
-# ----------------------------
-# Globals
-# ----------------------------
-SUPABASE_URL: str | None = None
-SUPABASE_KEY: str | None = None
-STRAVA_CLIENT_ID: str | None = None
-STRAVA_CLIENT_SECRET: str | None = None
+# -------------------------------------------------
+# Globals (initialized via init_clients)
+# -------------------------------------------------
+SUPABASE_URL = None
+SUPABASE_KEY = None
+STRAVA_CLIENT_ID = None
+STRAVA_CLIENT_SECRET = None
 
 supabase: Client | None = None
 
 
-# ----------------------------
+# -------------------------------------------------
 # Init clients from Streamlit secrets
-# ----------------------------
-def init_clients(st_app) -> None:
-    """
-    Required Streamlit secrets:
-      [strava] client_id, client_secret
-      [supabase] url, service_role_key
-    """
-    global SUPABASE_URL, SUPABASE_KEY, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, supabase
+# -------------------------------------------------
+def init_clients(st_app):
+    global SUPABASE_URL, SUPABASE_KEY
+    global STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET
+    global supabase
 
     STRAVA_CLIENT_ID = st_app.secrets["strava"]["client_id"]
     STRAVA_CLIENT_SECRET = st_app.secrets["strava"]["client_secret"]
@@ -36,11 +34,12 @@ def init_clients(st_app) -> None:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ----------------------------
+# -------------------------------------------------
 # OAuth helpers
-# ----------------------------
+# -------------------------------------------------
 def exchange_code_for_tokens(auth_code: str) -> dict:
     token_url = "https://www.strava.com/oauth/token"
+
     data = {
         "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
@@ -49,7 +48,11 @@ def exchange_code_for_tokens(auth_code: str) -> dict:
     }
 
     resp = requests.post(token_url, data=data, timeout=20)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        st.error(f"Strava token exchange failed ({resp.status_code})")
+        st.write(resp.text)
+        resp.raise_for_status()
+
     token_info = resp.json()
 
     athlete_resp = requests.get(
@@ -65,6 +68,7 @@ def exchange_code_for_tokens(auth_code: str) -> dict:
 
 def get_strava_access_token(refresh_token: str) -> str:
     token_url = "https://www.strava.com/oauth/token"
+
     data = {
         "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
@@ -77,14 +81,14 @@ def get_strava_access_token(refresh_token: str) -> str:
     return resp.json()["access_token"]
 
 
-# ----------------------------
+# -------------------------------------------------
 # Strava API
-# ----------------------------
+# -------------------------------------------------
 def fetch_activities_since(access_token: str, after_ts: int) -> list[dict]:
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    all_activities: list[dict] = []
+    all_activities = []
     page = 1
     per_page = 50
 
@@ -93,8 +97,10 @@ def fetch_activities_since(access_token: str, after_ts: int) -> list[dict]:
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         chunk = r.json()
+
         if not chunk:
             break
+
         all_activities.extend(chunk)
         page += 1
 
@@ -104,16 +110,19 @@ def fetch_activities_since(access_token: str, after_ts: int) -> list[dict]:
 def fetch_activity_streams(access_token: str, strava_activity_id: int) -> dict:
     url = f"https://www.strava.com/api/v3/activities/{strava_activity_id}/streams"
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"keys": "time,distance,altitude,heartrate,latlng", "key_by_type": "true"}
+    params = {
+        "keys": "time,distance,altitude,heartrate,latlng",
+        "key_by_type": "true",
+    }
 
     r = requests.get(url, headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-# ----------------------------
+# -------------------------------------------------
 # Sport mapping
-# ----------------------------
+# -------------------------------------------------
 def map_sport_group(strava_sport_type: str | None) -> str | None:
     ski_types = {"NordicSki", "BackcountrySki", "RollerSki"}
     run_types = {"Run", "TrailRun"}
@@ -128,24 +137,20 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
     return None
 
 
-# ----------------------------
-# TEMP: bypass last_dt (sync by days_back)
-# ----------------------------
+# -------------------------------------------------
+# TEMP: bypass last activity date (first sync)
+# -------------------------------------------------
 def get_last_activity_start_date(_user_id: int):
     return None
 
 
-# ----------------------------
+# -------------------------------------------------
 # Supabase: upsert activity summary
-# ----------------------------
+# -------------------------------------------------
 def upsert_activity_summary(act: dict, user_id: int) -> int | None:
-    """
-    Upserts into public.activities and returns local activities.id,
-    or None if skipped.
-    """
     sport_group = map_sport_group(act.get("sport_type"))
     if sport_group is None:
-        return None  # skip sports outside ski/run/walk
+        return None
 
     row = {
         "user_id": user_id,
@@ -166,7 +171,7 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "max_heartrate": act.get("max_heartrate"),
     }
 
-    # remove None fields (helps if DB has NOT NULL constraints)
+    # remove None values (safer with DB constraints)
     row = {k: v for k, v in row.items() if v is not None}
 
     try:
@@ -176,10 +181,8 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
             .execute()
         )
     except Exception as e:
-        # ✅ IMPORTANT: show real PostgREST error
         st.error("UPSERT activities FAILED (raw error):")
         st.write(e)
-        st.write("Row keys:", list(row.keys()))
         st.write("Row:", row)
         raise
 
@@ -190,9 +193,9 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
     return data[0]["id"]
 
 
-# ----------------------------
-# Supabase: insert segments (30s)
-# ----------------------------
+# -------------------------------------------------
+# Supabase: insert 30s segments (JSON-safe)
+# -------------------------------------------------
 def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df) -> int:
     if seg_df is None or seg_df.empty:
         return 0
@@ -206,6 +209,7 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
     ]
 
     df = seg_df.copy()
+
     for c in wanted:
         if c not in df.columns:
             df[c] = None
@@ -213,6 +217,15 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
     df["user_id"] = user_id
     df["sport_group"] = sport_group
     df["activity_id"] = activity_id
+
+    # 🔑 JSON-safe conversions
+    for col in ["t_start", "t_end"]:
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
+            )
+
+    df = df.replace({np.nan: None})
 
     rows = df[["user_id", "sport_group", "activity_id"] + wanted].to_dict(orient="records")
 
@@ -224,23 +237,23 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
         except Exception as e:
             st.error("INSERT activity_segments FAILED (raw error):")
             st.write(e)
-            st.write("First row example:", chunk[0] if chunk else None)
+            st.write("First row:", chunk[0] if chunk else None)
             raise
         total += len(chunk)
 
     return total
 
 
-# ----------------------------
+# -------------------------------------------------
 # Full sync + process pipeline
-# ----------------------------
+# -------------------------------------------------
 def sync_and_process_from_strava(
     token_info: dict,
     process_ski_activity_30s,
     process_run_walk_activity,
     params_by_sport: dict,
     days_back_if_empty: int = 200,
-) -> tuple[int, int]:
+):
     athlete = token_info["athlete"]
     athlete_id = athlete["id"]
 
@@ -251,7 +264,9 @@ def sync_and_process_from_strava(
     if last_dt:
         after_ts = int(last_dt.timestamp()) - 60
     else:
-        after_ts = int((datetime.now(timezone.utc) - timedelta(days=days_back_if_empty)).timestamp())
+        after_ts = int(
+            (datetime.now(timezone.utc) - timedelta(days=days_back_if_empty)).timestamp()
+        )
 
     activities = fetch_activities_since(access_token, after_ts)
 
@@ -278,7 +293,9 @@ def sync_and_process_from_strava(
                 streams=streams_norm,
                 **params_by_sport["ski"],
             )
-            total_segments += insert_segments_30s(athlete_id, "ski", local_activity_id, seg30)
+            total_segments += insert_segments_30s(
+                athlete_id, "ski", local_activity_id, seg30
+            )
 
         elif sport_group in ("run", "walk"):
             seg30 = process_run_walk_activity(
@@ -286,9 +303,10 @@ def sync_and_process_from_strava(
                 streams=streams_norm,
                 **params_by_sport["run"],
             )
-            total_segments += insert_segments_30s(athlete_id, sport_group, local_activity_id, seg30)
+            total_segments += insert_segments_30s(
+                athlete_id, sport_group, local_activity_id, seg30
+            )
 
         time.sleep(0.25)
 
     return new_acts, total_segments
-
