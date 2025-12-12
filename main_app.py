@@ -77,6 +77,6 @@ if st.button("Sync + Process + Save (no streams)"):
         process_ski_activity_30s=process_ski_activity_30s,
         process_run_walk_activity=process_run_walk_activity,
         params_by_sport=params_by_sport,
-        days_back_if_empty=10,
+        days_back_if_empty=100,
     )
     st.success(f"Готово. Активности: {new_acts}, записани 30s сегменти: {total_segments}")
