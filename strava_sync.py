@@ -527,6 +527,7 @@ def sync_and_process_from_strava(
         )
 
     activities = fetch_activities_since(access_token, after_ts)
+    activities = sorted(activities, key=lambda a: a.get("start_date") or "")
 
     new_acts = 0
     total_segments = 0
