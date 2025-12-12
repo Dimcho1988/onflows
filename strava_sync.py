@@ -113,9 +113,13 @@ def get_last_activity_start_date(user_id: int):
     # table is empty or PostgREST cannot order yet
     return None
 
-
-def upsert_activity_summary(act: dict, user_id: int) -> int:
+def upsert_activity_summary(act: dict, user_id: int) -> int | None:
     sport_group = map_sport_group(act.get("sport_type"))
+
+    # 👉 КРИТИЧНО: пропускаме активности извън ski / run / walk
+    if sport_group is None:
+        return None
+
     row = {
         "user_id": user_id,
         "strava_activity_id": act["id"],
@@ -124,15 +128,12 @@ def upsert_activity_summary(act: dict, user_id: int) -> int:
         "sport_group": sport_group,
         "start_date": act.get("start_date"),
         "timezone": act.get("timezone"),
-
         "distance_m": act.get("distance"),
         "moving_time_s": act.get("moving_time"),
         "elapsed_time_s": act.get("elapsed_time"),
         "total_elevation_gain_m": act.get("total_elevation_gain"),
-
         "avg_speed_mps": act.get("average_speed"),
         "max_speed_mps": act.get("max_speed"),
-
         "has_heartrate": act.get("has_heartrate", False),
         "avg_heartrate": act.get("average_heartrate"),
         "max_heartrate": act.get("max_heartrate"),
@@ -143,6 +144,10 @@ def upsert_activity_summary(act: dict, user_id: int) -> int:
         .upsert(row, on_conflict="strava_activity_id")
         .execute()
     )
+
+    if not res.data:
+        return None
+
     return res.data[0]["id"]
 
 
