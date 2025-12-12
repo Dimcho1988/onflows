@@ -1,7 +1,7 @@
-# run_walk_pipeline.py
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import timedelta
+from dateutil.parser import isoparse
 
 from cs_modulator import apply_cs_modulation
 
@@ -29,16 +29,18 @@ def build_points_from_streams(act_row: dict, streams: dict) -> pd.DataFrame:
     if n == 0:
         return pd.DataFrame(columns=["time", "dist", "elev", "hr"])
 
-    start = datetime.fromisoformat(act_row["start_date"])
+    start = isoparse(act_row["start_date"])
     times = [start + timedelta(seconds=float(t)) for t in time_arr]
 
-    df = pd.DataFrame({
-        "time": times,
-        "dist": dist_arr if len(dist_arr) == n else np.nan,
-        "elev": alt_arr if len(alt_arr) == n else np.nan,
-        "hr": hr_arr if len(hr_arr) == n else np.nan,
-    })
-    df["dist"] = df["dist"].ffill()
+    dist = dist_arr if len(dist_arr) == n else np.full(n, np.nan)
+    elev = alt_arr if len(alt_arr) == n else np.full(n, np.nan)
+    hr = hr_arr if len(hr_arr) == n else np.full(n, np.nan)
+
+    df = pd.DataFrame({"time": times, "dist": dist, "elev": elev, "hr": hr})
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"]).reset_index(drop=True)
+
+    df["dist"] = pd.to_numeric(df["dist"], errors="coerce").ffill()
     return df
 
 
@@ -47,10 +49,10 @@ def build_segments_30s(df, activity_id):
         return pd.DataFrame()
 
     df = df.sort_values("time").reset_index(drop=True)
-    times = df["time"].to_numpy()
-    elevs = df["elev"].to_numpy()
-    dists = df["dist"].to_numpy()
-    hrs = df["hr"].to_numpy()
+    times = df["time"].to_numpy(dtype="datetime64[ns]")
+    elevs = df["elev"].to_numpy(dtype=float)
+    dists = df["dist"].to_numpy(dtype=float)
+    hrs = df["hr"].to_numpy(dtype=float)
 
     n = len(df)
     start_idx = 0
@@ -80,22 +82,18 @@ def build_segments_30s(df, activity_id):
             start_idx = end_idx
             continue
 
-        if any(pd.isna([elev0, elev1])):
-            slope = np.nan
-        else:
-            slope = (elev1 - elev0) / d_m * 100.0 if d_m > 0 else np.nan
-
+        slope = (elev1 - elev0) / d_m * 100.0 if (d_m > 0 and np.isfinite(elev0) and np.isfinite(elev1)) else np.nan
         v_kmh = (d_m / dt) * 3.6
         hr_mean = float(np.nanmean(hrs[start_idx:end_idx + 1]))
 
         rows.append({
             "activity_id": activity_id,
             "seg_idx": seg_idx,
-            "t_start": pd.to_datetime(t0),
-            "t_end": pd.to_datetime(t1),
+            "t_start": pd.to_datetime(t0, utc=True),
+            "t_end": pd.to_datetime(t1, utc=True),
             "dt_s": float(dt),
             "d_m": float(d_m),
-            "slope_pct": float(slope) if not np.isnan(slope) else np.nan,
+            "slope_pct": float(slope) if np.isfinite(slope) else np.nan,
             "v_kmh_raw": float(v_kmh),
             "hr_mean": hr_mean,
         })
@@ -108,20 +106,18 @@ def build_segments_30s(df, activity_id):
 
 def apply_basic_filters(segments: pd.DataFrame) -> pd.DataFrame:
     seg = segments.copy()
-    valid_slope = seg["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE)
-    valid_slope &= seg["slope_pct"].notna()
+    valid_slope = seg["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE) & seg["slope_pct"].notna()
     valid_speed = seg["v_kmh_raw"].between(0.0, MAX_SPEED_FOR_MODEL * 1.2)
     seg["valid_basic"] = valid_slope & valid_speed
 
-    # speed_spikes по активност
     seg["speed_spike"] = False
     for aid, g in seg.groupby("activity_id"):
         g = g.sort_values("seg_idx")
         v = g["v_kmh_raw"].values
         spike = np.zeros(len(g), dtype=bool)
         for i in range(1, len(g)):
-            dv = abs(v[i] - v[i-1])
-            vmax = max(v[i], v[i-1])
+            dv = abs(v[i] - v[i - 1])
+            vmax = max(v[i], v[i - 1])
             if dv > 15.0 and vmax > 10.0:
                 spike[i] = True
         seg.loc[g.index, "speed_spike"] = spike
@@ -167,7 +163,7 @@ def fit_slope_poly(train_df: pd.DataFrame):
         return None
     x = train_df["slope_pct"].values.astype(float)
     y = train_df["F_raw"].values.astype(float)
-    if len(x) <= SLOPE_POLY_DEG:
+    if len(x) <= 2:
         return None
     coeffs = np.polyfit(x, y, SLOPE_POLY_DEG)
     raw_poly = np.poly1d(coeffs)
@@ -201,10 +197,7 @@ def compute_slope_F(slopes: np.ndarray, slope_poly, alpha_slope: float) -> np.nd
 def clean_speed_for_cs(g: pd.DataFrame, v_max_cs=30.0) -> np.ndarray:
     v = g["v_flat_eq"].to_numpy(dtype=float)
     v = np.clip(v, 0.0, v_max_cs)
-    if "speed_spike" in g.columns:
-        is_spike = g["speed_spike"].to_numpy(dtype=bool)
-    else:
-        is_spike = np.zeros_like(v, dtype=bool)
+    is_spike = g["speed_spike"].to_numpy(dtype=bool) if "speed_spike" in g.columns else np.zeros_like(v, dtype=bool)
     if not is_spike.any():
         return v
     v_clean = v.copy()
@@ -216,9 +209,12 @@ def clean_speed_for_cs(g: pd.DataFrame, v_max_cs=30.0) -> np.ndarray:
     return v_clean
 
 
-def process_run_walk_activity(act_row: dict, streams: dict, alpha_slope: float,
-                              V_crit: float, CS: float,
-                              tau_min: float, k_par: float, q_par: float, gamma_cs: float) -> pd.DataFrame:
+def process_run_walk_activity(
+    act_row: dict, streams: dict,
+    alpha_slope: float,
+    V_crit: float, CS: float,
+    tau_min: float, k_par: float, q_par: float, gamma_cs: float
+) -> pd.DataFrame:
     points = build_points_from_streams(act_row, streams)
     seg = build_segments_30s(points, activity_id=act_row["id"])
     if seg.empty:
@@ -229,18 +225,19 @@ def process_run_walk_activity(act_row: dict, streams: dict, alpha_slope: float,
     slope_train = get_slope_training_data(seg, V0)
     slope_poly = fit_slope_poly(slope_train)
 
-    seg["v_flat_eq"] = seg["v_kmh_raw"]  # default
+    seg["v_flat_eq"] = seg["v_kmh_raw"]
     if slope_poly is not None:
         F_vals = compute_slope_F(seg["slope_pct"].values, slope_poly, alpha_slope)
         v_flat_eq = seg["v_kmh_raw"].values * F_vals
+
+        # Run/walk: cap only (not equalize)
         if V_crit and V_crit > 0:
             idx_below = seg["slope_pct"] < -5.0
             v_flat_eq[idx_below] = np.minimum(v_flat_eq[idx_below], 0.8 * V_crit)
+
         seg["v_flat_eq"] = v_flat_eq
 
-    # CS
     seg = seg.sort_values("t_start").reset_index(drop=True)
-    seg["time_s"] = seg["dt_s"].cumsum() - seg["dt_s"]
     v_clean = clean_speed_for_cs(seg, v_max_cs=MAX_SPEED_FOR_MODEL)
     dt_arr = seg["dt_s"].to_numpy(dtype=float)
 
@@ -258,5 +255,9 @@ def process_run_walk_activity(act_row: dict, streams: dict, alpha_slope: float,
     seg["delta_v_plus_kmh"] = out_cs["delta_v_plus"]
     seg["r_kmh"] = out_cs["r"]
     seg["tau_s"] = out_cs["tau_s"]
+
+    # run/walk doesn't use glide but keep columns for DB compatibility
+    seg["k_glide"] = 1.0
+    seg["v_glide"] = seg["v_kmh_raw"]
 
     return seg
