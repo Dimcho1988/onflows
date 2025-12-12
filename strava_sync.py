@@ -211,7 +211,13 @@ def sync_and_process_from_strava(
     for act in activities:
         sport_group = map_sport_group(act.get("sport_type"))
         local_activity_id = upsert_activity_summary(act, user_id=athlete_id)
-        new_acts += 1
+
+# ако активността е пропусната (не ski/run/walk)
+if local_activity_id is None:
+    continue
+
+new_acts += 1
+
 
         if sport_group is None:
             continue
