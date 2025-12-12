@@ -48,31 +48,31 @@ st.success(
 
 st.sidebar.header("Параметри")
 
-# Ski params
+# Ski
 st.sidebar.subheader("Ski")
 V_crit_ski = st.sidebar.number_input("V_crit ski [km/h]", 5.0, 40.0, 20.0, 0.5)
 DAMP_GLIDE = st.sidebar.slider("DAMP_GLIDE", 0.0, 1.0, 1.0, 0.05)
 CS_ski = st.sidebar.number_input("CS ski [km/h]", 5.0, 40.0, 20.0, 0.5)
 
-# Run params
+# Run/Walk
 st.sidebar.subheader("Run/Walk")
 V_crit_run = st.sidebar.number_input("V_crit run [km/h]", 4.0, 30.0, 12.0, 0.5)
 CS_run = st.sidebar.number_input("CS run [km/h]", 4.0, 30.0, 12.0, 0.5)
 alpha_slope = st.sidebar.slider("alpha_slope (run/walk)", 0.0, 2.0, 1.0, 0.05)
 
-# CS params
+# CS model
 st.sidebar.subheader("CS model")
 tau_min = st.sidebar.number_input("tau_min [s]", 5.0, 120.0, 25.0, 1.0)
 k_par = st.sidebar.number_input("k_par", 0.0, 200.0, 35.0, 1.0)
 q_par = st.sidebar.number_input("q_par", 0.5, 3.0, 1.3, 0.05)
 gamma_cs = st.sidebar.number_input("gamma", 0.0, 2.0, 1.0, 0.05)
 
+days_back = st.sidebar.number_input("Days back (first sync)", min_value=1, max_value=5000, value=200, step=10)
+
 params_by_sport = {
     "ski": dict(V_crit=V_crit_ski, DAMP_GLIDE=DAMP_GLIDE, CS=CS_ski, tau_min=tau_min, k_par=k_par, q_par=q_par, gamma_cs=gamma_cs),
     "run": dict(alpha_slope=alpha_slope, V_crit=V_crit_run, CS=CS_run, tau_min=tau_min, k_par=k_par, q_par=q_par, gamma_cs=gamma_cs),
 }
-
-days_back = st.sidebar.number_input("Days back (first sync)", min_value=1, max_value=5000, value=200, step=10)
 
 if st.button("Sync + Process + Save (no streams)"):
     new_acts, total_segments = sync_and_process_from_strava(
