@@ -3,5 +3,5 @@ pandas
 numpy
 altair
 requests
-supabase
 python-dateutil
+supabase>=2
