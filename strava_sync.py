@@ -134,23 +134,26 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
 
 
 # -------------------------------------------------
-# Incremental sync helper
+# Incremental sync helper (SAFE)
 # -------------------------------------------------
 def get_last_activity_start_date(user_id: int):
-    res = (
-        supabase.table("activities")
-        .select("start_date")
-        .eq("user_id", user_id)
-        .order("start_date", desc=True)
-        .limit(1)
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("activities")
+            .select("start_date")
+            .eq("user_id", user_id)
+            .order("start_date", desc=True)
+            .limit(1)
+            .execute()
+        )
 
-    data = res.data or []
-    if not data:
+        data = res.data or []
+        if not data:
+            return None
+
+        return datetime.fromisoformat(data[0]["start_date"].replace("Z", "+00:00"))
+    except Exception:
         return None
-
-    return datetime.fromisoformat(data[0]["start_date"].replace("Z", "+00:00"))
 
 
 # -------------------------------------------------
@@ -230,23 +233,27 @@ def insert_segments_30s(
     df["segment_seconds"] = segment_seconds
     df["model_key"] = model_key
 
+    # JSON-safe timestamps
     for col in ["t_start", "t_end"]:
-        df[col] = df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else x)
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
+            )
 
     df = df.replace({np.nan: None})
 
     rows = df[
-        ["user_id", "sport_group", "activity_id",
-         "segment_seconds", "model_key"] + wanted
+        ["user_id", "sport_group", "activity_id", "segment_seconds", "model_key"] + wanted
     ].to_dict(orient="records")
 
     total = 0
     for i in range(0, len(rows), 1000):
+        chunk = rows[i:i + 1000]
         supabase.table("activity_segments").upsert(
-            rows[i:i + 1000],
+            chunk,
             on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
         ).execute()
-        total += min(1000, len(rows) - i)
+        total += len(chunk)
 
     return total
 
@@ -293,20 +300,22 @@ def sync_and_process_from_strava(
         streams = fetch_activity_streams(access_token, act["id"])
         streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
 
+        # IMPORTANT: do not pass model_key into process_* functions
         params = params_by_sport[sport_group]
-        model_key = params["model_key"]
+        params_proc = dict(params)
+        model_key = params_proc.pop("model_key", "unknown")
 
         if sport_group == "ski":
             seg30 = process_ski_activity_30s(
                 act_row={"id": local_activity_id, "start_date": act.get("start_date")},
                 streams=streams_norm,
-                **params,
+                **params_proc,
             )
         else:
             seg30 = process_run_walk_activity(
                 act_row={"id": local_activity_id, "start_date": act.get("start_date")},
                 streams=streams_norm,
-                **params,
+                **params_proc,
             )
 
         total_segments += insert_segments_30s(
@@ -322,3 +331,4 @@ def sync_and_process_from_strava(
         time.sleep(0.25)
 
     return new_acts, total_segments
+
