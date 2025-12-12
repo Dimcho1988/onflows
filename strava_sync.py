@@ -109,19 +109,9 @@ def map_sport_group(strava_sport_type: str) -> str | None:
 
 
 def get_last_activity_start_date(user_id: int):
-    res = (
-        supabase.table("activities")
-        .select("start_date")
-        .eq("user_id", user_id)
-        .order("start_date", desc=True)
-        .limit(1)
-        .execute()
-    )
-    data = res.data or []
-    if not data:
-        return None
-    # start_date is timestamptz in DB, comes as ISO string
-    return isoparse(data[0]["start_date"])
+    # TEMPORARY BYPASS:
+    # table is empty or PostgREST cannot order yet
+    return None
 
 
 def upsert_activity_summary(act: dict, user_id: int) -> int:
