@@ -1,8 +1,8 @@
-# strava_sync.py
 import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+from dateutil.parser import isoparse
 from supabase import create_client, Client
 
 SUPABASE_URL = None
@@ -31,14 +31,14 @@ def exchange_code_for_tokens(auth_code: str):
         "grant_type": "authorization_code",
         "code": auth_code,
     }
-    resp = requests.post(token_url, data=data, timeout=10)
+    resp = requests.post(token_url, data=data, timeout=20)
     resp.raise_for_status()
     token_info = resp.json()
 
     athlete_resp = requests.get(
         "https://www.strava.com/api/v3/athlete",
         headers={"Authorization": f"Bearer {token_info['access_token']}"},
-        timeout=10,
+        timeout=20,
     )
     athlete_resp.raise_for_status()
     token_info["athlete"] = athlete_resp.json()
@@ -53,7 +53,7 @@ def get_strava_access_token(refresh_token: str) -> str:
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-    resp = requests.post(token_url, data=data, timeout=10)
+    resp = requests.post(token_url, data=data, timeout=20)
     resp.raise_for_status()
     token_info = resp.json()
     return token_info["access_token"]
@@ -70,7 +70,7 @@ def fetch_activities_since(access_token: str, after_ts: int):
 
     while True:
         params = {"after": after_ts, "page": page, "per_page": per_page}
-        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         chunk = r.json()
         if not chunk:
@@ -88,7 +88,7 @@ def fetch_activity_streams(access_token: str, strava_activity_id: int):
         "keys": "time,distance,altitude,heartrate,latlng",
         "key_by_type": "true",
     }
-    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r = requests.get(url, headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -117,13 +117,14 @@ def get_last_activity_start_date(user_id: int):
         .limit(1)
         .execute()
     )
-    data = res.data
+    data = res.data or []
     if not data:
         return None
-    return datetime.fromisoformat(data[0]["start_date"])
+    # start_date is timestamptz in DB, comes as ISO string
+    return isoparse(data[0]["start_date"])
 
 
-def upsert_activity(act: dict, user_id: int) -> int:
+def upsert_activity_summary(act: dict, user_id: int) -> int:
     sport_group = map_sport_group(act.get("sport_type"))
     row = {
         "user_id": user_id,
@@ -131,15 +132,19 @@ def upsert_activity(act: dict, user_id: int) -> int:
         "name": act.get("name"),
         "sport_type": act.get("sport_type"),
         "sport_group": sport_group,
-        "distance": act.get("distance"),
-        "moving_time": act.get("moving_time"),
-        "elapsed_time": act.get("elapsed_time"),
         "start_date": act.get("start_date"),
         "timezone": act.get("timezone"),
-        "average_speed": act.get("average_speed"),
-        "max_speed": act.get("max_speed"),
+
+        "distance_m": act.get("distance"),
+        "moving_time_s": act.get("moving_time"),
+        "elapsed_time_s": act.get("elapsed_time"),
+        "total_elevation_gain_m": act.get("total_elevation_gain"),
+
+        "avg_speed_mps": act.get("average_speed"),
+        "max_speed_mps": act.get("max_speed"),
+
         "has_heartrate": act.get("has_heartrate", False),
-        "average_heartrate": act.get("average_heartrate"),
+        "avg_heartrate": act.get("average_heartrate"),
         "max_heartrate": act.get("max_heartrate"),
     }
 
@@ -151,24 +156,46 @@ def upsert_activity(act: dict, user_id: int) -> int:
     return res.data[0]["id"]
 
 
-def save_streams(activity_id: int, streams: dict):
-    supabase.table("activity_streams").delete().eq("activity_id", activity_id).execute()
-    rows = []
-    for stream_type, payload in streams.items():
-        rows.append(
-            {
-                "activity_id": activity_id,
-                "stream_type": stream_type,
-                "data": payload.get("data", []),
-            }
-        )
-    if not rows:
+def upsert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df):
+    if seg_df is None or seg_df.empty:
         return 0
-    res = supabase.table("activity_streams").insert(rows).execute()
-    return len(res.data)
+
+    wanted = [
+        "seg_idx","t_start","t_end","dt_s","d_m","slope_pct",
+        "v_kmh_raw","valid_basic","speed_spike",
+        "k_glide","v_glide",
+        "v_flat_eq","v_flat_eq_cs",
+        "delta_v_plus_kmh","r_kmh","tau_s","hr_mean"
+    ]
+    df = seg_df.copy()
+    for c in wanted:
+        if c not in df.columns:
+            df[c] = None
+
+    df["user_id"] = user_id
+    df["sport_group"] = sport_group
+    df["activity_id"] = activity_id
+
+    rows = df[["user_id","sport_group","activity_id"] + wanted].to_dict(orient="records")
+
+    total = 0
+    for i in range(0, len(rows), 1000):
+        chunk = rows[i:i+1000]
+        res = supabase.table("activity_segments").upsert(
+            chunk,
+            on_conflict="activity_id,sport_group,seg_idx"
+        ).execute()
+        total += len(res.data or [])
+    return total
 
 
-def sync_from_strava(token_info: dict):
+def sync_and_process_from_strava(
+    token_info: dict,
+    process_ski_activity_30s,
+    process_run_walk_activity,
+    params_by_sport: dict,
+    days_back_if_empty: int = 10,
+):
     athlete = token_info["athlete"]
     athlete_id = athlete["id"]
 
@@ -179,18 +206,35 @@ def sync_from_strava(token_info: dict):
     if last_dt:
         after_ts = int(last_dt.timestamp()) - 60
     else:
-        after_ts = int((datetime.now(timezone.utc) - timedelta(days=10)).timestamp())
+        after_ts = int((datetime.now(timezone.utc) - timedelta(days=days_back_if_empty)).timestamp())
 
     activities = fetch_activities_since(access_token, after_ts)
 
     new_acts = 0
-    total_stream_rows = 0
+    total_segments = 0
 
     for act in activities:
-        local_id = upsert_activity(act, user_id=athlete_id)
+        sport_group = map_sport_group(act.get("sport_type"))
+        local_activity_id = upsert_activity_summary(act, user_id=athlete_id)
         new_acts += 1
-        streams = fetch_activity_streams(access_token, act["id"])
-        total_stream_rows += save_streams(local_id, streams)
-        time.sleep(0.3)
 
-    return new_acts, total_stream_rows
+        if sport_group is None:
+            continue
+
+        streams = fetch_activity_streams(access_token, act["id"])
+        # normalize to streams dict: {k: {"data":[...]}}
+        streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
+
+        if sport_group == "ski":
+            p = params_by_sport.get("ski", {})
+            seg30 = process_ski_activity_30s(act_row={"id": local_activity_id, "start_date": act.get("start_date")}, streams=streams_norm, **p)
+            total_segments += upsert_segments_30s(athlete_id, "ski", local_activity_id, seg30)
+
+        elif sport_group in ("run", "walk"):
+            p = params_by_sport.get("run", {})
+            seg30 = process_run_walk_activity(act_row={"id": local_activity_id, "start_date": act.get("start_date")}, streams=streams_norm, **p)
+            total_segments += upsert_segments_30s(athlete_id, sport_group, local_activity_id, seg30)
+
+        time.sleep(0.25)
+
+    return new_acts, total_segments
