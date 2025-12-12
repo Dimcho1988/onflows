@@ -5,7 +5,8 @@ from dateutil.parser import isoparse
 
 from cs_modulator import apply_cs_modulation
 
-# --- 7s settings (glide training + initial segmentation)
+
+# --- 7s settings (internal segmentation)
 T_SEG_7 = 7.0
 MIN_D_SEG_7 = 5.0
 MIN_T_SEG_7 = 4.0
@@ -21,9 +22,9 @@ F_MIN_SLOPE = 0.7
 F_MAX_SLOPE = 1.7
 
 # --- 30s output settings
-T_SEG_30 = 30.0
-MIN_D_SEG_30 = 10.0
-MIN_T_SEG_30 = 15.0
+T_SEG_OUT = 30.0
+MIN_D_SEG_OUT = 10.0
+MIN_T_SEG_OUT = 15.0
 
 
 def build_points_from_streams(act_row: dict, streams: dict) -> pd.DataFrame:
@@ -115,7 +116,6 @@ def apply_basic_filters_7s(segments: pd.DataFrame) -> pd.DataFrame:
     valid_slope = seg["slope_pct"].between(-MAX_ABS_SLOPE_7, MAX_ABS_SLOPE_7) & seg["slope_pct"].notna()
     seg["valid_basic"] = valid_slope
 
-    # speed spikes per activity
     seg["speed_spike"] = False
     for aid, g in seg.groupby("activity_id"):
         g = g.sort_values("seg_idx")
@@ -132,9 +132,10 @@ def apply_basic_filters_7s(segments: pd.DataFrame) -> pd.DataFrame:
     return seg
 
 
-# --- GLIDE training on 7s
+# --- GLIDE training on 7s (requires consecutive downhills)
 def get_glide_training_segments(seg7: pd.DataFrame) -> pd.DataFrame:
     df = seg7.copy()
+    df = df.sort_values(["activity_id", "seg_idx"]).reset_index(drop=True)
     df["prev_slope"] = df.groupby("activity_id")["slope_pct"].shift(1)
     df["prev_valid"] = df.groupby("activity_id")["valid_basic"].shift(1)
 
@@ -158,63 +159,68 @@ def fit_glide_poly(train_df: pd.DataFrame):
     return np.poly1d(coeffs)
 
 
-def compute_glide_coefficients(seg7: pd.DataFrame, glide_poly, DAMP_GLIDE: float):
+def compute_k_glide_for_activity(seg7: pd.DataFrame, glide_poly, DAMP_GLIDE: float) -> float:
+    """
+    Per-activity K_glide:
+      - uses this activity's downhill training segments (consecutive downhills)
+      - k_raw = v_model(s_mean) / v_real_mean
+      - clip k_raw to [0.90, 1.25]
+      - k_final = 1 + DAMP_GLIDE*(k_clipped-1)
+    """
+    if glide_poly is None:
+        return 1.0
+
     train = get_glide_training_segments(seg7)
-    if glide_poly is None or train.empty:
-        return {}
+    if train.empty:
+        return 1.0
 
-    coeffs_dict = {}
-    for aid, g in train.groupby("activity_id"):
-        s_mean = g["slope_pct"].mean()
-        v_real = g["v_kmh_raw"].mean()
-        if v_real <= 0:
-            continue
-        v_model = float(glide_poly(s_mean))
-        if v_model <= 0:
-            continue
+    s_mean = float(train["slope_pct"].mean())
+    v_real = float(train["v_kmh_raw"].mean())
+    if v_real <= 0:
+        return 1.0
 
-        k_raw = v_model / v_real
-        k_clipped = max(0.90, min(1.25, k_raw))
-        k_final = 1.0 + DAMP_GLIDE * (k_clipped - 1.0)
-        coeffs_dict[aid] = k_final
+    v_model = float(glide_poly(s_mean))
+    if v_model <= 0:
+        return 1.0
 
-    return coeffs_dict
+    k_raw = v_model / v_real
+    k_clip = max(0.90, min(1.25, k_raw))
+    k_final = 1.0 + float(DAMP_GLIDE) * (k_clip - 1.0)
+    return float(k_final)
 
 
-def apply_glide_modulation_7s(seg7: pd.DataFrame, glide_coeffs: dict) -> pd.DataFrame:
+def apply_glide_modulation_7s(seg7: pd.DataFrame, k_glide: float) -> pd.DataFrame:
     seg = seg7.copy()
-    seg["k_glide"] = seg["activity_id"].map(glide_coeffs).fillna(1.0)
+    seg["k_glide"] = float(k_glide)
     seg["v_glide"] = seg["v_kmh_raw"] * seg["k_glide"]
     return seg
 
 
-# --- Aggregate 7s -> 30s (distance/time weighted)
-def aggregate_7s_to_30s(seg7: pd.DataFrame, activity_id: int) -> pd.DataFrame:
+# --- Aggregate 7s -> OUT seconds (30s by default)
+def aggregate_7s_to_out(seg7: pd.DataFrame, activity_id: int) -> pd.DataFrame:
     if seg7.empty:
         return pd.DataFrame()
 
     df = seg7.sort_values("t_start").reset_index(drop=True).copy()
 
-    # build 30s windows by accumulating time
     rows = []
     buf = []
     t_sum = 0.0
-    seg_idx30 = 0
+    seg_idx_out = 0
 
-    def flush(buf_rows, seg_idx30_local):
+    def flush(buf_rows, seg_idx_local):
         if not buf_rows:
             return None
         g = pd.DataFrame(buf_rows)
 
         dt = float(g["dt_s"].sum())
         d = float(g["d_m"].sum())
-        if dt < MIN_T_SEG_30 or d < MIN_D_SEG_30:
+        if dt < MIN_T_SEG_OUT or d < MIN_D_SEG_OUT:
             return None
 
         t_start = g["t_start"].iloc[0]
         t_end = g["t_end"].iloc[-1]
 
-        # weighted averages
         w_t = g["dt_s"].to_numpy(dtype=float)
         w_d = g["d_m"].to_numpy(dtype=float)
 
@@ -236,7 +242,7 @@ def aggregate_7s_to_30s(seg7: pd.DataFrame, activity_id: int) -> pd.DataFrame:
 
         return {
             "activity_id": activity_id,
-            "seg_idx": int(seg_idx30_local),
+            "seg_idx": int(seg_idx_local),
             "t_start": t_start,
             "t_end": t_end,
             "dt_s": dt,
@@ -253,36 +259,26 @@ def aggregate_7s_to_30s(seg7: pd.DataFrame, activity_id: int) -> pd.DataFrame:
     for _, r in df.iterrows():
         buf.append(r.to_dict())
         t_sum += float(r["dt_s"])
-        if t_sum >= T_SEG_30:
-            out = flush(buf, seg_idx30)
+        if t_sum >= T_SEG_OUT:
+            out = flush(buf, seg_idx_out)
             if out is not None:
                 rows.append(out)
-                seg_idx30 += 1
+                seg_idx_out += 1
             buf = []
             t_sum = 0.0
 
-    # flush остатък, ако има
-    out = flush(buf, seg_idx30)
+    out = flush(buf, seg_idx_out)
     if out is not None:
         rows.append(out)
 
     return pd.DataFrame(rows)
 
 
-# --- SLOPE model on 30s (uses v_glide as base)
-def compute_flat_ref_speed_30(seg30: pd.DataFrame) -> float | None:
-    m = seg30["valid_basic"] & seg30["slope_pct"].between(-1.0, 1.0) & seg30["v_glide"].notna()
-    g = seg30.loc[m]
-    if g.empty:
-        return None
-    v = float(g["v_glide"].mean())
-    return v if v > 0 else None
-
-
-def get_slope_training_data_30(seg30: pd.DataFrame, V_flat_ref: float) -> pd.DataFrame:
+# --- SLOPE model on OUT (uses v_glide)
+def get_slope_training_data_out(seg_out: pd.DataFrame, V_flat_ref: float) -> pd.DataFrame:
     if V_flat_ref is None or V_flat_ref <= 0:
         return pd.DataFrame(columns=["slope_pct", "F"])
-    df = seg30.copy()
+    df = seg_out.copy()
     m = df["valid_basic"] & df["slope_pct"].between(-15.0, 15.0) & (df["v_glide"] > 0)
     train = df.loc[m, ["slope_pct", "v_glide"]].copy()
     if train.empty:
@@ -307,8 +303,8 @@ def fit_slope_poly(train_df: pd.DataFrame):
     return np.poly1d(coeffs_corr)
 
 
-def apply_slope_modulation_30(seg30: pd.DataFrame, slope_poly, V_crit: float) -> pd.DataFrame:
-    df = seg30.copy()
+def apply_slope_modulation_out(seg_out: pd.DataFrame, slope_poly, V_crit: float) -> pd.DataFrame:
+    df = seg_out.copy()
     if slope_poly is None:
         df["v_flat_eq"] = df["v_glide"]
         return df
@@ -326,7 +322,6 @@ def apply_slope_modulation_30(seg30: pd.DataFrame, slope_poly, V_crit: float) ->
 
     v_flat_eq = df["v_glide"].to_numpy(dtype=float) * F_vals
 
-    # Ski: equalize effort on downhills (< -3%)
     if V_crit is not None and V_crit > 0:
         idx = (df["valid_basic"]) & (df["slope_pct"] < -3.0)
         v_flat_eq[idx.to_numpy(dtype=bool)] = 0.7 * V_crit
@@ -335,10 +330,10 @@ def apply_slope_modulation_30(seg30: pd.DataFrame, slope_poly, V_crit: float) ->
     return df
 
 
-def clean_speed_for_cs(seg30: pd.DataFrame, v_max_cs=50.0) -> np.ndarray:
-    v = seg30["v_flat_eq"].to_numpy(dtype=float)
+def clean_speed_for_cs(seg_out: pd.DataFrame, v_max_cs=50.0) -> np.ndarray:
+    v = seg_out["v_flat_eq"].to_numpy(dtype=float)
     v = np.clip(v, 0.0, v_max_cs)
-    is_spike = seg30["speed_spike"].to_numpy(dtype=bool) if "speed_spike" in seg30.columns else np.zeros_like(v, dtype=bool)
+    is_spike = seg_out["speed_spike"].to_numpy(dtype=bool) if "speed_spike" in seg_out.columns else np.zeros_like(v, dtype=bool)
     if not is_spike.any():
         return v
     v_clean = v.copy()
@@ -360,39 +355,49 @@ def process_ski_activity_30s(
     k_par: float,
     q_par: float,
     gamma_cs: float,
-) -> pd.DataFrame:
+    glide_poly_override=None,  # rolling from last 30 (7s)
+    slope_poly_override=None,  # rolling from last 30 (30s)
+):
     activity_id = act_row["id"]
 
     points = build_points_from_streams(act_row, streams)
     if points.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     # 1) 7s segments
     seg7 = build_segments_fixed_seconds(points, activity_id, T_SEG_7, MIN_T_SEG_7, MIN_D_SEG_7)
     if seg7.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    # 2) filters on 7s
     seg7 = apply_basic_filters_7s(seg7)
 
-    # 3) glide model on 7s
-    train_glide = get_glide_training_segments(seg7)
-    glide_poly = fit_glide_poly(train_glide)
-    glide_coeffs = compute_glide_coefficients(seg7, glide_poly, DAMP_GLIDE) if glide_poly is not None else {}
-    seg7 = apply_glide_modulation_7s(seg7, glide_coeffs)
+    # 2) glide poly: rolling override else local
+    glide_poly = glide_poly_override
+    if glide_poly is None:
+        train_glide = get_glide_training_segments(seg7)
+        glide_poly = fit_glide_poly(train_glide)
 
-    # 4) aggregate to 30s (this is what we store)
-    seg30 = aggregate_7s_to_30s(seg7, activity_id=activity_id)
+    # 3) K_glide for THIS activity from its 7s downhills
+    k_glide = compute_k_glide_for_activity(seg7, glide_poly, DAMP_GLIDE)
+    seg7 = apply_glide_modulation_7s(seg7, k_glide)
+
+    # 4) aggregate to OUT=30s and store
+    seg30 = aggregate_7s_to_out(seg7, activity_id=activity_id)
     if seg30.empty:
-        return seg30
+        return seg30, seg7
 
-    # 5) slope model on 30s (uses v_glide)
-    V_flat_ref = compute_flat_ref_speed_30(seg30)
-    slope_train = get_slope_training_data_30(seg30, V_flat_ref)
-    slope_poly = fit_slope_poly(slope_train)
-    seg30 = apply_slope_modulation_30(seg30, slope_poly, V_crit)
+    # 5) slope poly: use rolling override else local
+    slope_poly = slope_poly_override
+    if slope_poly is None:
+        m_flat = seg30["valid_basic"] & seg30["slope_pct"].between(-1.0, 1.0) & seg30["v_glide"].notna()
+        V_flat_ref = float(seg30.loc[m_flat, "v_glide"].mean()) if m_flat.any() else None
+        if V_flat_ref is not None and np.isfinite(V_flat_ref) and V_flat_ref > 0:
+            slope_train = get_slope_training_data_out(seg30, V_flat_ref)
+            slope_poly = fit_slope_poly(slope_train)
 
-    # 6) CS on 30s v_flat_eq
+    seg30 = apply_slope_modulation_out(seg30, slope_poly, V_crit)
+
+    # 6) CS on 30s
     seg30 = seg30.sort_values("t_start").reset_index(drop=True)
     v_clean = clean_speed_for_cs(seg30, v_max_cs=50.0)
     dt_arr = seg30["dt_s"].to_numpy(dtype=float)
@@ -412,9 +417,4 @@ def process_ski_activity_30s(
     seg30["r_kmh"] = out_cs["r"]
     seg30["tau_s"] = out_cs["tau_s"]
 
-    # ensure columns for DB exist
-    for c in ["valid_basic","speed_spike","k_glide","v_glide","hr_mean"]:
-        if c not in seg30.columns:
-            seg30[c] = None
-
-    return seg30
+    return seg30, seg7
