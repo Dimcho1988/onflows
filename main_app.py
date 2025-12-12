@@ -15,10 +15,11 @@ def get_token_info():
         token_info = exchange_code_for_tokens(auth_code)
         st.session_state["token_info"] = token_info
         return token_info
+
     return None
 
 
-st.set_page_config(page_title="onFlows – Strava → Supabase (segments)", layout="wide")
+st.set_page_config(page_title="onFlows – Strava → Supabase (30s segments)", layout="wide")
 st.title("onFlows – Strava → processing → Supabase (30s segments)")
 
 init_clients(st)
@@ -71,12 +72,15 @@ params_by_sport = {
     "run": dict(alpha_slope=alpha_slope, V_crit=V_crit_run, CS=CS_run, tau_min=tau_min, k_par=k_par, q_par=q_par, gamma_cs=gamma_cs),
 }
 
+days_back = st.sidebar.number_input("Days back (first sync)", min_value=1, max_value=5000, value=200, step=10)
+
 if st.button("Sync + Process + Save (no streams)"):
     new_acts, total_segments = sync_and_process_from_strava(
         token_info=token_info,
         process_ski_activity_30s=process_ski_activity_30s,
         process_run_walk_activity=process_run_walk_activity,
         params_by_sport=params_by_sport,
-        days_back_if_empty=200,
+        days_back_if_empty=int(days_back),
     )
     st.success(f"Готово. Активности: {new_acts}, записани 30s сегменти: {total_segments}")
+
