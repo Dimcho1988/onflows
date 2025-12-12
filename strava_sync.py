@@ -7,7 +7,7 @@ import numpy as np
 from supabase import create_client, Client
 
 # -------------------------------------------------
-# Globals (initialized via init_clients)
+# Globals
 # -------------------------------------------------
 SUPABASE_URL = None
 SUPABASE_KEY = None
@@ -48,11 +48,7 @@ def exchange_code_for_tokens(auth_code: str) -> dict:
     }
 
     resp = requests.post(token_url, data=data, timeout=20)
-    if resp.status_code >= 400:
-        st.error(f"Strava token exchange failed ({resp.status_code})")
-        st.write(resp.text)
-        resp.raise_for_status()
-
+    resp.raise_for_status()
     token_info = resp.json()
 
     athlete_resp = requests.get(
@@ -138,10 +134,34 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
 
 
 # -------------------------------------------------
-# TEMP: bypass last activity date (first sync)
+# Incremental sync helper (SAFE)
 # -------------------------------------------------
-def get_last_activity_start_date(_user_id: int):
-    return None
+def get_last_activity_start_date(user_id: int):
+    """
+    Returns datetime of the latest activity start_date for this user,
+    or None if table is empty or any error occurs.
+    """
+    try:
+        res = (
+            supabase.table("activities")
+            .select("start_date")
+            .eq("user_id", user_id)
+            .order("start_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        data = res.data or []
+        if not data:
+            return None
+
+        # Supabase returns ISO string
+        return datetime.fromisoformat(
+            data[0]["start_date"].replace("Z", "+00:00")
+        )
+
+    except Exception:
+        return None
 
 
 # -------------------------------------------------
@@ -171,20 +191,14 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "max_heartrate": act.get("max_heartrate"),
     }
 
-    # remove None values (safer with DB constraints)
+    # remove None values
     row = {k: v for k, v in row.items() if v is not None}
 
-    try:
-        res = (
-            supabase.table("activities")
-            .upsert(row, on_conflict="strava_activity_id")
-            .execute()
-        )
-    except Exception as e:
-        st.error("UPSERT activities FAILED (raw error):")
-        st.write(e)
-        st.write("Row:", row)
-        raise
+    res = (
+        supabase.table("activities")
+        .upsert(row, on_conflict="strava_activity_id")
+        .execute()
+    )
 
     data = res.data or []
     if not data:
@@ -218,7 +232,7 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
     df["sport_group"] = sport_group
     df["activity_id"] = activity_id
 
-    # 🔑 JSON-safe conversions
+    # JSON-safe timestamps
     for col in ["t_start", "t_end"]:
         if col in df.columns:
             df[col] = df[col].apply(
@@ -227,18 +241,14 @@ def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df
 
     df = df.replace({np.nan: None})
 
-    rows = df[["user_id", "sport_group", "activity_id"] + wanted].to_dict(orient="records")
+    rows = df[["user_id", "sport_group", "activity_id"] + wanted].to_dict(
+        orient="records"
+    )
 
     total = 0
     for i in range(0, len(rows), 1000):
         chunk = rows[i:i + 1000]
-        try:
-            supabase.table("activity_segments").insert(chunk).execute()
-        except Exception as e:
-            st.error("INSERT activity_segments FAILED (raw error):")
-            st.write(e)
-            st.write("First row:", chunk[0] if chunk else None)
-            raise
+        supabase.table("activity_segments").insert(chunk).execute()
         total += len(chunk)
 
     return total
@@ -261,6 +271,7 @@ def sync_and_process_from_strava(
     access_token = get_strava_access_token(refresh_token)
 
     last_dt = get_last_activity_start_date(athlete_id)
+
     if last_dt:
         after_ts = int(last_dt.timestamp()) - 60
     else:
