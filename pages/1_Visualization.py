@@ -39,11 +39,8 @@ def safe_float(x):
 
 
 # -----------------------------
-# Zone helpers (speed/intensity)
+# Zone helpers
 # -----------------------------
-ZONE_ORDER = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
-
-
 def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
     z = np.full_like(intensity, "Z?", dtype=object)
     x = intensity
@@ -57,86 +54,8 @@ def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
     return z
 
 
-def compute_hr_zone_ranked(seg: pd.DataFrame, zone_col: str = "zone_u", hr_col: str = "hr_mean") -> pd.Series:
-    """
-    HR zones by ranked HR, using counts from speed zones:
-      - count how many segments are in each speed zone (Z1..Z6)
-      - sort segments by hr_mean ascending
-      - assign first n(Z1) -> Z1, next n(Z2) -> Z2, ... etc
-    """
-    if seg.empty:
-        return pd.Series([], dtype=object)
-
-    out = pd.Series(["Z?"] * len(seg), index=seg.index, dtype=object)
-
-    if zone_col not in seg.columns:
-        return out
-
-    counts = seg[zone_col].value_counts(dropna=False).to_dict()
-    zone_counts = {z: int(counts.get(z, 0)) for z in ZONE_ORDER}
-    total_need = sum(zone_counts.values())
-
-    if total_need <= 0 or hr_col not in seg.columns:
-        return out
-
-    # only consider rows that have a valid speed zone among Z1..Z6
-    valid_idx = seg.index[seg[zone_col].isin(ZONE_ORDER)]
-    if len(valid_idx) == 0:
-        return out
-
-    # sort by HR (NaN HR goes last)
-    tmp = seg.loc[valid_idx, [hr_col]].copy()
-    tmp["__hr__"] = pd.to_numeric(tmp[hr_col], errors="coerce")
-    tmp = tmp.sort_values("__hr__", ascending=True, na_position="last")
-
-    ordered_idx = tmp.index.tolist()
-
-    # if HR missing for many segments, still keep ordering; they will be last -> higher zones typically
-    pos = 0
-    for z in ZONE_ORDER:
-        k = zone_counts.get(z, 0)
-        if k <= 0:
-            continue
-        take = ordered_idx[pos:pos + k]
-        out.loc[take] = z
-        pos += k
-
-    # any leftovers (shouldn't happen if counts match) -> keep Z?
-    return out
-
-
 # -----------------------------
-# Auto CS of activity (critical speed of the activity)
-# -----------------------------
-def estimate_activity_cs(seg: pd.DataFrame, speed_col: str) -> float | None:
-    """
-    Heuristic CS(activity) from segments:
-      - uses valid_basic & non-spike if present
-      - drops NaNs
-      - CS = 90th percentile of speed_col (stable for most sessions)
-    """
-    if seg.empty or speed_col not in seg.columns:
-        return None
-
-    df = seg.copy()
-    if "valid_basic" in df.columns:
-        df = df[df["valid_basic"].fillna(True)]
-    if "speed_spike" in df.columns:
-        df = df[~df["speed_spike"].fillna(False)]
-
-    v = pd.to_numeric(df[speed_col], errors="coerce").to_numpy(dtype=float)
-    v = v[np.isfinite(v) & (v > 0)]
-    if v.size < 8:
-        return None
-
-    cs = float(np.nanpercentile(v, 90))
-    if not np.isfinite(cs) or cs <= 0:
-        return None
-    return cs
-
-
-# -----------------------------
-# Fit slope poly from last-30 segments
+# Fit slope poly from last-30 RAW segments (NO model_key filter)
 # -----------------------------
 def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
     """
@@ -155,6 +74,7 @@ def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
     if df.empty:
         return None
 
+    # basic filters similar to pipeline
     m = (
         df["valid_basic"].fillna(True)
         & (~df["speed_spike"].fillna(False))
@@ -189,6 +109,14 @@ def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
 
 
 def apply_shape_constraints(F: np.ndarray, slopes: np.ndarray, fmin=0.7, fmax=1.7, alpha=1.0):
+    """
+    Same style constraints as pipeline:
+      clip to [fmin,fmax]
+      |s|<=1 -> 1
+      downhills -> <=1
+      uphills -> >=1
+      alpha scaling around 1
+    """
     slopes = np.asarray(slopes, dtype=float)
     F = np.asarray(F, dtype=float)
 
@@ -205,26 +133,6 @@ def apply_shape_constraints(F: np.ndarray, slopes: np.ndarray, fmin=0.7, fmax=1.
 
     F = 1.0 + float(alpha) * (F - 1.0)
     return F
-
-
-def poly_to_formula(poly: np.poly1d | None, var: str = "s") -> str:
-    if poly is None:
-        return "None"
-    c = np.array(poly.coefficients, dtype=float)
-    deg = len(c) - 1
-    parts = []
-    for i, a in enumerate(c):
-        p = deg - i
-        if not np.isfinite(a):
-            continue
-        if p == 0:
-            parts.append(f"{a:+.6f}")
-        elif p == 1:
-            parts.append(f"{a:+.6f}·{var}")
-        else:
-            parts.append(f"{a:+.6f}·{var}^{p}")
-    s = " ".join(parts).lstrip("+").strip()
-    return s if s else "0"
 
 
 # -----------------------------
@@ -263,7 +171,6 @@ def fetch_available_models(activity_id: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=30)
 def fetch_segments(activity_id: int, sport_group: str, segment_seconds: int, model_key: str) -> pd.DataFrame:
-    # include hr_zone_ranked if exists
     res = (
         supabase.table("activity_segments")
         .select("*")
@@ -282,10 +189,8 @@ def fetch_segments(activity_id: int, sport_group: str, segment_seconds: int, mod
     df["t_start"] = df["t_start"].apply(to_utc_dt)
     df["t_end"] = df["t_end"].apply(to_utc_dt)
 
-    for c in [
-        "dt_s", "d_m", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "hr_mean",
-        "delta_v_plus_kmh", "r_kmh", "tau_s", "k_glide", "v_glide"
-    ]:
+    for c in ["dt_s", "d_m", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "hr_mean",
+              "delta_v_plus_kmh", "r_kmh", "tau_s", "k_glide", "v_glide"]:
         if c in df.columns:
             df[c] = df[c].apply(safe_float)
 
@@ -293,15 +198,22 @@ def fetch_segments(activity_id: int, sport_group: str, segment_seconds: int, mod
         if c in df.columns:
             df[c] = df[c].fillna(False).astype(bool)
 
-    # hr_zone_ranked might be missing in some DB versions
-    if "hr_zone_ranked" not in df.columns:
-        df["hr_zone_ranked"] = None
-
     return df
 
 
 @st.cache_data(ttl=30)
-def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_seconds: int, model_key: str, n_acts: int = 30) -> pd.DataFrame:
+def fetch_last30_segments_for_fit_raw(
+    user_id: int,
+    sport_group: str,
+    segment_seconds: int,
+    n_acts: int = 30
+) -> tuple[pd.DataFrame, list[int]]:
+    """
+    ВАЖНО: Това е RAW last-30 fit (без model_key филтър).
+    Взима последните 30 активности по sport_group и после всички сегменти (RAW) за тях
+    по sport_group + segment_seconds.
+    Връща (df_segments, activity_ids_used)
+    """
     res = (
         supabase.table("activities")
         .select("id")
@@ -313,7 +225,7 @@ def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_second
     )
     ids = [r["id"] for r in (res.data or []) if r.get("id") is not None]
     if not ids:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
 
     res2 = (
         supabase.table("activity_segments")
@@ -321,12 +233,11 @@ def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_second
         .in_("activity_id", ids)
         .eq("sport_group", sport_group)
         .eq("segment_seconds", segment_seconds)
-        .eq("model_key", model_key)
         .execute()
     )
     df = pd.DataFrame(res2.data or [])
     if df.empty:
-        return df
+        return df, ids
 
     for c in ["slope_pct", "v_kmh_raw"]:
         if c in df.columns:
@@ -334,14 +245,15 @@ def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_second
     for c in ["valid_basic", "speed_spike"]:
         if c in df.columns:
             df[c] = df[c].fillna(False).astype(bool)
-    return df
+
+    return df, ids
 
 
 # -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="onFlows – Visualization", layout="wide")
-st.title("onFlows – Visualization (speed-zones + hr_zone_ranked + last-30 slope curve)")
+st.title("onFlows – Visualization (RAW last-30 regression curve)")
 
 init_clients(st)
 
@@ -349,16 +261,15 @@ with st.sidebar:
     st.header("User / Params")
     user_id = st.number_input("user_id (athlete_id)", min_value=1, value=41661616, step=1)
 
-    st.subheader("Intensity base")
-    use_cs_mod = st.checkbox("Use v_flat_eq_cs as base speed (if available)", value=True)
-
-    st.subheader("CS of activity")
-    cs_mode = st.selectbox("CS mode", ["AUTO (from activity)", "MANUAL (override)"], index=0)
-    cs_manual = st.number_input("CS manual [km/h]", 2.0, 60.0, 12.0, 0.5)
+    st.subheader("Zoning / CS")
+    CS_run = st.number_input("CS run [km/h]", 4.0, 30.0, 12.0, 0.5)
+    CS_walk = st.number_input("CS walk [km/h]", 2.0, 20.0, 7.0, 0.5)
+    CS_ski = st.number_input("CS ski [km/h]", 5.0, 40.0, 20.0, 0.5)
+    use_cs_mod = st.checkbox("Use v_flat_eq_cs for intensity", value=True)
 
     st.subheader("Slope regression display")
     alpha_slope_viz = st.slider("alpha_slope (display)", 0.0, 2.0, 1.0, 0.05)
-    show_last30_curve = st.checkbox("Show last-30 fitted curve", value=True)
+    show_last30_curve = st.checkbox("Show RAW last-30 fitted curve", value=True)
 
 acts = fetch_activities(int(user_id))
 if acts.empty:
@@ -402,44 +313,32 @@ if seg.empty:
     st.error("Сегментите не се зареждат.")
     st.stop()
 
+CS = CS_run if sport_group == "run" else (CS_walk if sport_group == "walk" else CS_ski)
+CS = float(CS) if CS and CS > 0 else np.nan
+
 seg = seg.sort_values("seg_idx").reset_index(drop=True)
 seg["t_rel_s"] = np.cumsum(seg["dt_s"].fillna(0.0).to_numpy(dtype=float)) - seg["dt_s"].fillna(0.0).to_numpy(dtype=float)
-
-# base speed for intensity
-has_cs_mod = ("v_flat_eq_cs" in seg.columns) and seg["v_flat_eq_cs"].notna().any()
-base_col = "v_flat_eq_cs" if (use_cs_mod and has_cs_mod) else "v_flat_eq"
-seg["v_base"] = seg[base_col]
-
-# CS(activity)
-cs_auto = estimate_activity_cs(seg, speed_col="v_base")
-CS = cs_auto if (cs_mode.startswith("AUTO") and cs_auto is not None) else float(cs_manual)
-if not np.isfinite(CS) or CS <= 0:
-    CS = np.nan
-
+seg["v_base"] = seg["v_flat_eq_cs"] if use_cs_mod and seg["v_flat_eq_cs"].notna().any() else seg["v_flat_eq"]
 seg["intensity"] = seg["v_base"] / CS if np.isfinite(CS) else np.nan
 seg["zone_u"] = zones_from_intensity(seg["intensity"].to_numpy(dtype=float))
-
-# HR zone ranked (compute every time, so it matches the current speed zone definition)
-seg["hr_zone_ranked_calc"] = compute_hr_zone_ranked(seg, zone_col="zone_u", hr_col="hr_mean")
-
-# load
 seg["load_u"] = seg["dt_s"].fillna(0.0) * np.nan_to_num(seg["intensity"].to_numpy(dtype=float), nan=0.0) ** 2
 
 # Header
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("sport_group", sport_group)
 c2.metric("segments", int(len(seg)))
 c3.metric("segment_seconds", seg_seconds)
 c4.metric("model_key", model_key)
-c5.metric("CS(activity) [km/h]", f"{CS:.2f}" if np.isfinite(CS) else "NA")
 
-tabs = st.tabs(["Приравняване", "Модели (slope)", "CS модулатор", "Зони + HR (ranked) + натоварване", "Таблица сегменти"])
+tabs = st.tabs(["Приравняване", "Модели (slope/glide)", "CS модулатор", "Зони + натоварване"])
 
 
 # -----------------------------
-# Tab: Models (slope)
+# Tab: Models
 # -----------------------------
 with tabs[1]:
+    base_col = "v_flat_eq_cs" if (use_cs_mod and seg["v_flat_eq_cs"].notna().any()) else "v_flat_eq"
+
     m = (
         seg["valid_basic"].fillna(True)
         & seg["slope_pct"].notna()
@@ -450,7 +349,8 @@ with tabs[1]:
     dfm = seg.loc[m, ["slope_pct", "v_kmh_raw", base_col]].copy()
     dfm["F_implied"] = dfm[base_col] / dfm["v_kmh_raw"]
 
-    st.subheader("Наклонен модел (точки + last-30 регресионна крива)")
+    st.subheader("Наклонен модел (точки + RAW last-30 регресионна крива)")
+
     scat = (
         alt.Chart(dfm)
         .mark_circle(size=45, opacity=0.55)
@@ -464,19 +364,25 @@ with tabs[1]:
     )
 
     line = None
-    poly = None
     if show_last30_curve:
-        train_last30 = fetch_last30_segments_for_fit(
+        train_last30, ids_used = fetch_last30_segments_for_fit_raw(
             user_id=int(user_id),
             sport_group=sport_group,
             segment_seconds=seg_seconds,
-            model_key=model_key,
             n_acts=30,
+        )
+
+        st.caption(
+            f"RAW last-30 set: activities_used={len(ids_used)} (target=30), "
+            f"segments_fetched={len(train_last30)} (sport={sport_group}, seg={seg_seconds}s, NO model_key filter)"
         )
 
         poly = fit_slope_poly_last30(train_last30, deg=2)
         if poly is None:
-            st.warning("Не успях да fit-на регресия от last-30 (вероятно липсват flat сегменти или има малко валидни данни).")
+            st.warning(
+                "Не успях да fit-на регресия от RAW last-30. "
+                "Причина обикновено е: малко валидни сегменти, липса на flat сегменти (-1..1%), или твърде много spikes."
+            )
         else:
             s_grid = np.linspace(-15, 15, 241)
             F_grid = poly(s_grid)
@@ -493,118 +399,48 @@ with tabs[1]:
                 )
             )
 
+            st.caption(f"RAW last-30 fit: poly deg=2 (shifted to F(0)=1), then clipped + alpha={alpha_slope_viz:.2f}")
+
     if line is not None:
         st.altair_chart(scat + line, use_container_width=True)
     else:
         st.altair_chart(scat, use_container_width=True)
 
-    st.markdown("**Формула (last-30 poly, преди shape constraints):**")
-    st.code(f"F(s) = {poly_to_formula(poly, var='s')}", language="text")
-
 
 # -----------------------------
-# Tab: Normalization
+# Other tabs (minimal)
 # -----------------------------
 with tabs[0]:
-    dfp = seg[["seg_idx", "t_rel_s", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "v_base", "hr_mean"]].copy()
+    dfp = seg[["seg_idx", "t_rel_s", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "hr_mean"]].copy()
     dfp["t_min"] = dfp["t_rel_s"] / 60.0
-    long = pd.melt(
-        dfp,
-        id_vars=["seg_idx", "t_min"],
-        value_vars=["v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "v_base"],
-        var_name="metric",
-        value_name="v_kmh",
-    )
+    long = pd.melt(dfp, id_vars=["seg_idx", "t_min"], value_vars=["v_kmh_raw", "v_flat_eq", "v_flat_eq_cs"], var_name="metric", value_name="v_kmh")
     st.altair_chart(
-        alt.Chart(long.dropna(subset=["v_kmh"]))
-        .mark_line()
-        .encode(
+        alt.Chart(long.dropna(subset=["v_kmh"])).mark_line().encode(
             x=alt.X("t_min:Q", title="време [min]"),
             y=alt.Y("v_kmh:Q", title="скорост [km/h]"),
             color="metric:N",
-        )
-        .properties(height=320)
-        .interactive(),
-        use_container_width=True,
+        ).properties(height=320).interactive(),
+        use_container_width=True
     )
 
-
-# -----------------------------
-# Tab: CS Modulator
-# -----------------------------
 with tabs[2]:
     cols = ["seg_idx", "t_rel_s", "v_base", "delta_v_plus_kmh", "r_kmh", "tau_s"]
-    cols = [c for c in cols if c in seg.columns]
     dfc = seg[cols].copy()
     dfc["t_min"] = dfc["t_rel_s"] / 60.0
-
     st.altair_chart(
-        alt.Chart(dfc.dropna(subset=["v_base"]))
-        .mark_line()
-        .encode(
+        alt.Chart(dfc.dropna(subset=["v_base"])).mark_line().encode(
             x=alt.X("t_min:Q", title="време [min]"),
-            y=alt.Y("v_base:Q", title="v_base [km/h]"),
-        )
-        .properties(height=220)
-        .interactive(),
-        use_container_width=True,
+            y=alt.Y("v_base:Q", title="v (eq or eq_cs) [km/h]"),
+        ).properties(height=220).interactive(),
+        use_container_width=True
     )
 
-
-# -----------------------------
-# Tab: Zones + HR ranked + Load
-# -----------------------------
 with tabs[3]:
-    st.subheader("Speed zones (по % от CS(activity))")
     ztab = (
         seg.groupby("zone_u", dropna=False)
-        .agg(
-            segments=("seg_idx", "count"),
-            time_s=("dt_s", "sum"),
-            dist_m=("d_m", "sum"),
-            load=("load_u", "sum"),
-            v_mean=("v_base", "mean"),
-            hr_mean=("hr_mean", "mean"),
-        )
+        .agg(time_s=("dt_s", "sum"), dist_m=("d_m", "sum"), load=("load_u", "sum"), v_mean=("v_base", "mean"))
         .reset_index()
     )
     ztab["time_min"] = ztab["time_s"] / 60.0
     ztab["dist_km"] = ztab["dist_m"] / 1000.0
-    st.dataframe(ztab[["zone_u", "segments", "time_min", "dist_km", "v_mean", "hr_mean", "load"]], use_container_width=True)
-
-    st.subheader("HR zones ranked (същия брой сегменти като speed зоните)")
-    htab = (
-        seg.groupby("hr_zone_ranked_calc", dropna=False)
-        .agg(
-            segments=("seg_idx", "count"),
-            time_s=("dt_s", "sum"),
-            dist_m=("d_m", "sum"),
-            v_mean=("v_base", "mean"),
-            hr_mean=("hr_mean", "mean"),
-        )
-        .reset_index()
-        .rename(columns={"hr_zone_ranked_calc": "hr_zone_ranked"})
-    )
-    htab["time_min"] = htab["time_s"] / 60.0
-    htab["dist_km"] = htab["dist_m"] / 1000.0
-    st.dataframe(htab[["hr_zone_ranked", "segments", "time_min", "dist_km", "v_mean", "hr_mean"]], use_container_width=True)
-
-    st.subheader("Cross-tab: speed zone vs HR-ranked zone (segments)")
-    ctab = pd.crosstab(seg["zone_u"], seg["hr_zone_ranked_calc"], dropna=False)
-    st.dataframe(ctab, use_container_width=True)
-
-
-# -----------------------------
-# Tab: Segments table
-# -----------------------------
-with tabs[4]:
-    show_cols = [
-        "seg_idx", "t_start", "dt_s", "d_m",
-        "slope_pct", "v_kmh_raw", "v_glide", "k_glide",
-        "v_flat_eq", "v_flat_eq_cs", "v_base",
-        "hr_mean", "zone_u", "hr_zone_ranked_calc",
-        "valid_basic", "speed_spike",
-        "delta_v_plus_kmh", "r_kmh", "tau_s",
-    ]
-    show_cols = [c for c in show_cols if c in seg.columns]
-    st.dataframe(seg[show_cols], use_container_width=True)
+    st.dataframe(ztab[["zone_u", "time_min", "dist_km", "v_mean", "load"]], use_container_width=True)
