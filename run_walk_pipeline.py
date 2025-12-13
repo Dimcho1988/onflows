@@ -209,6 +209,45 @@ def clean_speed_for_cs(g: pd.DataFrame, v_max_cs=30.0) -> np.ndarray:
     return v_clean
 
 
+# -------------------------------------------------
+# HR zone ranked (match counts by speed zone, assign by lowest HR)
+# -------------------------------------------------
+def add_hr_zone_ranked(seg_df: pd.DataFrame, zone_col: str = "zone", hr_col: str = "hr_mean") -> pd.DataFrame:
+    """
+    Creates hr_zone_ranked:
+      - Counts segments per speed zone (zone_col) within this activity
+      - Sorts segments by hr_mean ascending (NaN at end)
+      - Assigns hr_zone_ranked labels with same counts as speed zones
+    """
+    df = seg_df.copy()
+    if df is None or df.empty:
+        return df
+
+    if zone_col not in df.columns or hr_col not in df.columns:
+        df["hr_zone_ranked"] = None
+        return df
+
+    zone_counts = df[zone_col].fillna("UNK").value_counts().to_dict()
+
+    ordered_zones = [z for z in ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"] if z in zone_counts]
+    total_needed = int(sum(zone_counts.get(z, 0) for z in ordered_zones))
+
+    df["_hr_sort"] = pd.to_numeric(df[hr_col], errors="coerce")
+    df = df.sort_values(["_hr_sort"], ascending=True, na_position="last").reset_index(drop=True)
+
+    labels: list[str] = []
+    for z in ordered_zones:
+        labels.extend([z] * int(zone_counts.get(z, 0)))
+
+    hr_ranked = [None] * len(df)
+    for i in range(min(total_needed, len(df))):
+        hr_ranked[i] = labels[i]
+
+    df["hr_zone_ranked"] = hr_ranked
+    df = df.drop(columns=["_hr_sort"])
+    return df
+
+
 def process_run_walk_activity(
     act_row: dict,
     streams: dict,
@@ -219,8 +258,8 @@ def process_run_walk_activity(
     k_par: float,
     q_par: float,
     gamma_cs: float,
-    slope_poly_override=None,  # NEW: rolling regression
-    **kwargs,                  # NEW: future-proof (avoid TypeError)
+    slope_poly_override=None,  # rolling regression from last 30 activities
+    **kwargs,                  # future-proof (avoid TypeError)
 ) -> pd.DataFrame:
     points = build_points_from_streams(act_row, streams)
     seg = build_segments_30s(points, activity_id=act_row["id"])
@@ -269,4 +308,8 @@ def process_run_walk_activity(
     seg["k_glide"] = 1.0
     seg["v_glide"] = seg["v_kmh_raw"]
 
+    # NOTE: zones are computed elsewhere; here we only add HR-ranked zones if 'zone' exists
+    seg = add_hr_zone_ranked(seg)
+
     return seg
+
