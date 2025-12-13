@@ -1,4 +1,3 @@
-# run_walk_pipeline.py
 import numpy as np
 import pandas as pd
 from datetime import timedelta
@@ -20,20 +19,31 @@ MIN_D_SEG = 10.0
 MIN_T_SEG = 15.0
 
 
-# -----------------------------
-# zones (универсални, по % от CS)
-# -----------------------------
-def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
-    z = np.full_like(intensity, "Z?", dtype=object)
-    x = intensity
-    z[x < 0.75] = "Z1"
-    z[(x >= 0.75) & (x < 0.85)] = "Z2"
-    z[(x >= 0.85) & (x < 0.95)] = "Z3"
-    z[(x >= 0.95) & (x < 1.05)] = "Z4"
-    z[(x >= 1.05) & (x < 1.15)] = "Z5"
-    z[x >= 1.15] = "Z6"
-    z[~np.isfinite(x)] = "Z?"
-    return z
+# -------------------------------------------------
+# Speed zones (relative to V_crit)
+# -------------------------------------------------
+ZONE_BOUNDS = [0.0, 0.75, 0.85, 0.95, 1.05, 1.15, np.inf]
+ZONE_NAMES = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
+
+
+def assign_speed_zones_from_vcrit(v_eq: np.ndarray, V_crit: float) -> np.ndarray:
+    if V_crit is None or not np.isfinite(V_crit) or V_crit <= 0:
+        return np.array([None] * len(v_eq), dtype=object)
+
+    rel = np.asarray(v_eq, dtype=float) / float(V_crit)
+    out = np.array([None] * len(rel), dtype=object)
+
+    for i, r in enumerate(rel):
+        if not np.isfinite(r):
+            out[i] = None
+            continue
+        z = None
+        for j in range(len(ZONE_NAMES)):
+            if ZONE_BOUNDS[j] <= r < ZONE_BOUNDS[j + 1]:
+                z = ZONE_NAMES[j]
+                break
+        out[i] = z
+    return out
 
 
 def build_points_from_streams(act_row: dict, streams: dict) -> pd.DataFrame:
@@ -142,6 +152,55 @@ def apply_basic_filters(segments: pd.DataFrame) -> pd.DataFrame:
     return seg
 
 
+def compute_global_flat_speed(seg_f: pd.DataFrame) -> float | None:
+    df = seg_f.copy()
+    mask_flat = (
+        df["valid_basic"]
+        & df["slope_pct"].between(-1.0, 1.0)
+        & (df["v_kmh_raw"] > MIN_SPEED_FOR_MODEL)
+        & (df["v_kmh_raw"] < MAX_SPEED_FOR_MODEL)
+    )
+    flat = df.loc[mask_flat]
+    if flat.empty:
+        return None
+    return float(flat["v_kmh_raw"].mean())
+
+
+def get_slope_training_data(seg_f: pd.DataFrame, V0: float) -> pd.DataFrame:
+    if V0 is None or V0 <= 0:
+        return pd.DataFrame(columns=["slope_pct", "F_raw"])
+
+    df = seg_f.copy()
+    mask = (
+        df["valid_basic"]
+        & df["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE)
+        & (df["v_kmh_raw"] > MIN_SPEED_FOR_MODEL)
+        & (df["v_kmh_raw"] < MAX_SPEED_FOR_MODEL)
+    )
+    train = df.loc[mask, ["slope_pct", "v_kmh_raw"]].copy()
+    if train.empty:
+        return pd.DataFrame(columns=["slope_pct", "F_raw"])
+
+    train["F_raw"] = V0 / train["v_kmh_raw"]
+    return train
+
+
+def fit_slope_poly(train_df: pd.DataFrame):
+    if train_df.empty:
+        return None
+    x = train_df["slope_pct"].values.astype(float)
+    y = train_df["F_raw"].values.astype(float)
+    if len(x) <= 2:
+        return None
+    coeffs = np.polyfit(x, y, SLOPE_POLY_DEG)
+    raw_poly = np.poly1d(coeffs)
+    F0 = float(raw_poly(0.0))
+    offset = F0 - 1.0
+    coeffs_corr = raw_poly.coefficients.copy()
+    coeffs_corr[-1] -= offset
+    return np.poly1d(coeffs_corr)
+
+
 def compute_slope_F(slopes: np.ndarray, slope_poly, alpha_slope: float) -> np.ndarray:
     slopes = np.asarray(slopes, dtype=float)
     if slope_poly is None:
@@ -178,12 +237,12 @@ def clean_speed_for_cs(g: pd.DataFrame, v_max_cs=30.0) -> np.ndarray:
 
 
 # -------------------------------------------------
-# HR zone ranked (match counts by speed zone_u, assign by lowest HR)
+# HR zone ranked (match counts by speed zone, assign by lowest HR)
 # -------------------------------------------------
-def add_hr_zone_ranked(seg_df: pd.DataFrame, zone_col: str = "zone_u", hr_col: str = "hr_mean") -> pd.DataFrame:
+def add_hr_zone_ranked(seg_df: pd.DataFrame, zone_col: str = "zone", hr_col: str = "hr_mean") -> pd.DataFrame:
     """
     Creates hr_zone_ranked:
-      - Counts segments per speed zone (zone_col) within this activity
+      - Counts segments per speed zone (zone_col)
       - Sorts segments by hr_mean ascending (NaN at end)
       - Assigns hr_zone_ranked labels with same counts as speed zones
     """
@@ -195,11 +254,12 @@ def add_hr_zone_ranked(seg_df: pd.DataFrame, zone_col: str = "zone_u", hr_col: s
         df["hr_zone_ranked"] = None
         return df
 
-    zone_counts = df[zone_col].fillna("UNK").value_counts().to_dict()
-
-    ordered_zones = [z for z in ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"] if z in zone_counts]
+    # count only known zones
+    zone_counts = df[zone_col].value_counts(dropna=True).to_dict()
+    ordered_zones = [z for z in ZONE_NAMES if z in zone_counts]
     total_needed = int(sum(zone_counts.get(z, 0) for z in ordered_zones))
 
+    # sort by HR (valid HR first)
     df["_hr_sort"] = pd.to_numeric(df[hr_col], errors="coerce")
     df = df.sort_values(["_hr_sort"], ascending=True, na_position="last").reset_index(drop=True)
 
@@ -226,8 +286,8 @@ def process_run_walk_activity(
     k_par: float,
     q_par: float,
     gamma_cs: float,
-    slope_poly_override=None,  # IMPORTANT: last-30 activities regression poly
-    **kwargs,
+    slope_poly_override=None,  # rolling regression from last N activities (<=30)
+    **kwargs,                  # future-proof
 ) -> pd.DataFrame:
     points = build_points_from_streams(act_row, streams)
     seg = build_segments_30s(points, activity_id=act_row["id"])
@@ -236,8 +296,12 @@ def process_run_walk_activity(
 
     seg = apply_basic_filters(seg)
 
-    # IMPORTANT: НЯМА fit тук. Само прилагаме last-30 poly (ако го има)
+    # ---- slope poly (rolling window if provided; else fallback to current activity) ----
     slope_poly = slope_poly_override
+    if slope_poly is None:
+        V0 = compute_global_flat_speed(seg)
+        slope_train = get_slope_training_data(seg, V0)
+        slope_poly = fit_slope_poly(slope_train)
 
     seg["v_flat_eq"] = seg["v_kmh_raw"]
     if slope_poly is not None:
@@ -251,6 +315,10 @@ def process_run_walk_activity(
 
         seg["v_flat_eq"] = v_flat_eq
 
+    # ---- zones (speed-based) so hr_zone_ranked has something to match ----
+    seg["zone"] = assign_speed_zones_from_vcrit(seg["v_flat_eq"].to_numpy(dtype=float), float(V_crit) if V_crit else np.nan)
+
+    # ---- CS modulation ----
     seg = seg.sort_values("t_start").reset_index(drop=True)
     v_clean = clean_speed_for_cs(seg, v_max_cs=MAX_SPEED_FOR_MODEL)
     dt_arr = seg["dt_s"].to_numpy(dtype=float)
@@ -270,17 +338,10 @@ def process_run_walk_activity(
     seg["r_kmh"] = out_cs["r"]
     seg["tau_s"] = out_cs["tau_s"]
 
-    # compat placeholders
     seg["k_glide"] = 1.0
     seg["v_glide"] = seg["v_kmh_raw"]
 
-    # --- compute zones NOW (so hr_zone_ranked can be stored to DB) ---
-    CS_eff = float(CS) if CS and CS > 0 else np.nan
-    v_base = seg["v_flat_eq_cs"].to_numpy(dtype=float)
-    intensity = v_base / CS_eff if np.isfinite(CS_eff) else np.full(len(seg), np.nan)
-    seg["zone_u"] = zones_from_intensity(intensity)
-
-    # hr_zone_ranked based on zone_u
-    seg = add_hr_zone_ranked(seg, zone_col="zone_u", hr_col="hr_mean")
+    # ---- HR-ranked zones (counts match speed zones) ----
+    seg = add_hr_zone_ranked(seg, zone_col="zone", hr_col="hr_mean")
 
     return seg
