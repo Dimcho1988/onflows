@@ -5,6 +5,9 @@ import streamlit as st
 from supabase import create_client, Client
 
 
+# -----------------------------
+# Supabase init
+# -----------------------------
 SUPABASE_URL = None
 SUPABASE_KEY = None
 supabase: Client | None = None
@@ -35,6 +38,9 @@ def safe_float(x):
         return np.nan
 
 
+# -----------------------------
+# Zone helpers (UI-only zones from intensity/CS)
+# -----------------------------
 def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
     z = np.full_like(intensity, "Z?", dtype=object)
     x = intensity
@@ -48,24 +54,23 @@ def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
     return z
 
 
-def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
+# -----------------------------
+# Fit slope poly from last-N (activities)
+# -----------------------------
+def fit_slope_poly_lastN(seg_df: pd.DataFrame, deg: int = 2):
     """
-    LAST-30 ACTIVITIES robust fit:
-
-    - Compute V0 PER ACTIVITY from FLAT segments only: |slope| <= 1
-    - For NON-FLAT segments: F_raw = V0_activity / v_raw
-    - Pool across activities and polyfit(F_raw vs slope)
-    - Shift so F(0)=1
+    Fit F_raw(s) from segments:
+      V0 = mean(v_raw) on near-flat slopes [-1,1]
+      F_raw = V0 / v_raw
+      polyfit(F_raw vs slope)
+      shift so F(0)=1
+    Returns np.poly1d or None.
     """
     if seg_df is None or seg_df.empty:
         return None
 
     df = seg_df.copy()
-    need_cols = {"activity_id", "slope_pct", "v_kmh_raw"}
-    if not need_cols.issubset(set(df.columns)):
-        return None
-
-    df = df.dropna(subset=["activity_id", "slope_pct", "v_kmh_raw"])
+    df = df.dropna(subset=["slope_pct", "v_kmh_raw"])
     if df.empty:
         return None
 
@@ -76,43 +81,26 @@ def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
         & (df["v_kmh_raw"] > 3.0)
         & (df["v_kmh_raw"] < 30.0)
     )
-    df = df.loc[m, ["activity_id", "slope_pct", "v_kmh_raw"]].copy()
-    if df.empty:
+    df = df.loc[m, ["slope_pct", "v_kmh_raw"]].copy()
+    if len(df) < 10:
         return None
 
-    flat = df.loc[df["slope_pct"].abs() <= 1.0].copy()
-    if flat.empty:
+    V0 = df.loc[df["slope_pct"].between(-1.0, 1.0), "v_kmh_raw"].mean()
+    if not np.isfinite(V0) or V0 <= 0:
         return None
 
-    v0 = flat.groupby("activity_id")["v_kmh_raw"].mean().rename("V0").reset_index()
-    nflat = flat.groupby("activity_id")["v_kmh_raw"].size().rename("n_flat").reset_index()
-    v0 = v0.merge(nflat, on="activity_id", how="left")
-    v0 = v0.loc[v0["n_flat"] >= 2].copy()
-    if v0.empty:
-        return None
+    df["F_raw"] = V0 / df["v_kmh_raw"]
+    x = df["slope_pct"].to_numpy(dtype=float)
+    y = df["F_raw"].to_numpy(dtype=float)
 
-    df2 = df.merge(v0[["activity_id", "V0"]], on="activity_id", how="inner")
-    if df2.empty:
-        return None
-
-    df_fit = df2.loc[df2["slope_pct"].abs() > 1.0].copy()
-    if len(df_fit) <= deg + 6:
-        return None
-
-    df_fit["F_raw"] = df_fit["V0"] / df_fit["v_kmh_raw"]
-
-    x = df_fit["slope_pct"].to_numpy(dtype=float)
-    y = df_fit["F_raw"].to_numpy(dtype=float)
-    if len(x) <= deg + 6:
+    if len(x) <= deg + 2:
         return None
 
     coeffs = np.polyfit(x, y, deg)
     raw_poly = np.poly1d(coeffs)
 
+    # shift to enforce F(0)=1
     F0 = float(raw_poly(0.0))
-    if not np.isfinite(F0):
-        return None
-
     offset = F0 - 1.0
     coeffs_corr = raw_poly.coefficients.copy()
     coeffs_corr[-1] -= offset
@@ -138,6 +126,9 @@ def apply_shape_constraints(F: np.ndarray, slopes: np.ndarray, fmin=0.7, fmax=1.
     return F
 
 
+# -----------------------------
+# Data fetch
+# -----------------------------
 @st.cache_data(ttl=30)
 def fetch_activities(user_id: int) -> pd.DataFrame:
     res = (
@@ -202,19 +193,37 @@ def fetch_segments(activity_id: int, sport_group: str, segment_seconds: int, mod
 
 
 @st.cache_data(ttl=30)
-def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_seconds: int, model_key: str, n_acts: int = 30) -> pd.DataFrame:
+def fetch_lastN_segments_for_fit(
+    user_id: int,
+    sport_group: str,
+    segment_seconds: int,
+    model_key: str,
+    exclude_activity_id: int | None,
+    n_acts: int = 30,
+) -> tuple[pd.DataFrame, list[int]]:
+    """
+    Returns (segments_df, activity_ids_used)
+    Uses up to last n_acts activities by start_date.
+    Optionally excludes current activity_id from training.
+    """
+    # get latest activities
     res = (
         supabase.table("activities")
         .select("id")
         .eq("user_id", user_id)
         .eq("sport_group", sport_group)
         .order("start_date", desc=True)
-        .limit(n_acts)
+        .limit(n_acts + 10)
         .execute()
     )
-    ids = [r["id"] for r in (res.data or []) if r.get("id") is not None]
+    ids_all = [int(r["id"]) for r in (res.data or []) if r.get("id") is not None]
+
+    if exclude_activity_id is not None:
+        ids_all = [i for i in ids_all if int(i) != int(exclude_activity_id)]
+
+    ids = ids_all[: max(0, int(n_acts))]
     if not ids:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
 
     res2 = (
         supabase.table("activity_segments")
@@ -227,7 +236,7 @@ def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_second
     )
     df = pd.DataFrame(res2.data or [])
     if df.empty:
-        return df
+        return df, ids
 
     for c in ["slope_pct", "v_kmh_raw"]:
         if c in df.columns:
@@ -235,11 +244,15 @@ def fetch_last30_segments_for_fit(user_id: int, sport_group: str, segment_second
     for c in ["valid_basic", "speed_spike"]:
         if c in df.columns:
             df[c] = df[c].fillna(False).astype(bool)
-    return df
+
+    return df, ids
 
 
+# -----------------------------
+# UI
+# -----------------------------
 st.set_page_config(page_title="onFlows – Visualization", layout="wide")
-st.title("onFlows – Visualization (last-30 activities regression)")
+st.title("onFlows – Visualization (rolling last-N activities)")
 
 init_clients(st)
 
@@ -254,8 +267,10 @@ with st.sidebar:
     use_cs_mod = st.checkbox("Use v_flat_eq_cs for intensity", value=True)
 
     st.subheader("Slope regression display")
+    N_train = st.slider("N_train activities (rolling)", 1, 30, 30, 1)
+    exclude_current = st.checkbox("Exclude текущата активност от training", value=True)
     alpha_slope_viz = st.slider("alpha_slope (display)", 0.0, 2.0, 1.0, 0.05)
-    show_last30_curve = st.checkbox("Show last-30 ACTIVITIES fitted curve", value=True)
+    show_lastN_curve = st.checkbox("Show last-N fitted curve", value=True)
 
 acts = fetch_activities(int(user_id))
 if acts.empty:
@@ -304,21 +319,26 @@ CS = float(CS) if CS and CS > 0 else np.nan
 
 seg = seg.sort_values("seg_idx").reset_index(drop=True)
 seg["t_rel_s"] = np.cumsum(seg["dt_s"].fillna(0.0).to_numpy(dtype=float)) - seg["dt_s"].fillna(0.0).to_numpy(dtype=float)
-seg["v_base"] = seg["v_flat_eq_cs"] if use_cs_mod and seg["v_flat_eq_cs"].notna().any() else seg["v_flat_eq"]
+seg["v_base"] = seg["v_flat_eq_cs"] if use_cs_mod and seg.get("v_flat_eq_cs") is not None and seg["v_flat_eq_cs"].notna().any() else seg["v_flat_eq"]
 seg["intensity"] = seg["v_base"] / CS if np.isfinite(CS) else np.nan
 seg["zone_u"] = zones_from_intensity(seg["intensity"].to_numpy(dtype=float))
 seg["load_u"] = seg["dt_s"].fillna(0.0) * np.nan_to_num(seg["intensity"].to_numpy(dtype=float), nan=0.0) ** 2
 
+# Header
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("sport_group", sport_group)
 c2.metric("segments", int(len(seg)))
 c3.metric("segment_seconds", seg_seconds)
 c4.metric("model_key", model_key)
 
-tabs = st.tabs(["Приравняване", "Модели (slope/glide)", "CS модулатор", "Зони + натоварване", "Таблица сегменти"])
+tabs = st.tabs(["Приравняване", "Модели (slope/glide)", "CS модулатор", "Зони (UI)", "Зони + HR (от DB)"])
 
+
+# -----------------------------
+# Tab: Models
+# -----------------------------
 with tabs[1]:
-    base_col = "v_flat_eq_cs" if (use_cs_mod and seg["v_flat_eq_cs"].notna().any()) else "v_flat_eq"
+    base_col = "v_flat_eq_cs" if (use_cs_mod and "v_flat_eq_cs" in seg.columns and seg["v_flat_eq_cs"].notna().any()) else "v_flat_eq"
 
     m = (
         seg["valid_basic"].fillna(True)
@@ -330,7 +350,8 @@ with tabs[1]:
     dfm = seg.loc[m, ["slope_pct", "v_kmh_raw", base_col]].copy()
     dfm["F_implied"] = dfm[base_col] / dfm["v_kmh_raw"]
 
-    st.subheader("Наклонен модел (точки + last-30 ACTIVITIES регресионна крива)")
+    st.subheader("Наклонен модел (точки + rolling last-N регресионна крива)")
+
     scat = (
         alt.Chart(dfm)
         .mark_circle(size=45, opacity=0.55)
@@ -344,26 +365,27 @@ with tabs[1]:
     )
 
     line = None
-    if show_last30_curve:
-        train_last30 = fetch_last30_segments_for_fit(
+    train_info = ""
+
+    if show_lastN_curve:
+        exclude_id = activity_id if exclude_current else None
+
+        train_seg, train_ids = fetch_lastN_segments_for_fit(
             user_id=int(user_id),
             sport_group=sport_group,
             segment_seconds=seg_seconds,
             model_key=model_key,
-            n_acts=30,
+            exclude_activity_id=exclude_id,
+            n_acts=int(N_train),
         )
 
-        if train_last30.empty:
-            st.warning("Няма last-30 сегменти за fit.")
-        else:
-            st.caption(
-                f"last-30: rows={len(train_last30)} | flat(|s|<=1%)={int((train_last30['slope_pct'].abs()<=1).sum())} "
-                f"| activities={train_last30['activity_id'].nunique()}"
-            )
+        poly = fit_slope_poly_lastN(train_seg, deg=2)
 
-        poly = fit_slope_poly_last30(train_last30, deg=2)
+        train_info = f"Training set: activities_used={len(train_ids)} (target N={int(N_train)}), segments={len(train_seg)}"
+        st.caption(train_info)
+
         if poly is None:
-            st.warning("Не успях да fit-на регресия от last-30 activities (липсват flat сегменти за V0 или има малко валидни данни).")
+            st.warning("Не успях да fit-на регресия от rolling last-N (липса на flat сегменти или твърде малко валидни данни).")
         else:
             s_grid = np.linspace(-15, 15, 241)
             F_grid = poly(s_grid)
@@ -380,38 +402,68 @@ with tabs[1]:
                 )
             )
 
-            st.caption(f"Last-30 fit: poly deg=2 (V0 per-activity), then clipped + alpha={alpha_slope_viz:.2f}")
+            st.caption(f"Fit: poly deg=2 (shifted F(0)=1) + constraints + alpha={alpha_slope_viz:.2f}")
 
     if line is not None:
         st.altair_chart(scat + line, use_container_width=True)
     else:
         st.altair_chart(scat, use_container_width=True)
 
+
+# -----------------------------
+# Tab: Приравняване
+# -----------------------------
 with tabs[0]:
     dfp = seg[["seg_idx", "t_rel_s", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "hr_mean"]].copy()
     dfp["t_min"] = dfp["t_rel_s"] / 60.0
-    long = pd.melt(dfp, id_vars=["seg_idx", "t_min"], value_vars=["v_kmh_raw", "v_flat_eq", "v_flat_eq_cs"], var_name="metric", value_name="v_kmh")
+    long = pd.melt(
+        dfp,
+        id_vars=["seg_idx", "t_min"],
+        value_vars=[c for c in ["v_kmh_raw", "v_flat_eq", "v_flat_eq_cs"] if c in dfp.columns],
+        var_name="metric",
+        value_name="v_kmh"
+    )
     st.altair_chart(
-        alt.Chart(long.dropna(subset=["v_kmh"])).mark_line().encode(
+        alt.Chart(long.dropna(subset=["v_kmh"]))
+        .mark_line()
+        .encode(
             x=alt.X("t_min:Q", title="време [min]"),
             y=alt.Y("v_kmh:Q", title="скорост [km/h]"),
             color="metric:N",
-        ).properties(height=320).interactive(),
+        )
+        .properties(height=320)
+        .interactive(),
         use_container_width=True
     )
 
+
+# -----------------------------
+# Tab: CS modulator
+# -----------------------------
 with tabs[2]:
-    cols = ["seg_idx", "t_rel_s", "v_base", "delta_v_plus_kmh", "r_kmh", "tau_s"]
+    cols = [c for c in ["seg_idx", "t_rel_s", "v_base", "delta_v_plus_kmh", "r_kmh", "tau_s"] if c in seg.columns]
     dfc = seg[cols].copy()
     dfc["t_min"] = dfc["t_rel_s"] / 60.0
-    st.altair_chart(
-        alt.Chart(dfc.dropna(subset=["v_base"])).mark_line().encode(
-            x=alt.X("t_min:Q", title="време [min]"),
-            y=alt.Y("v_base:Q", title="v (eq or eq_cs) [km/h]"),
-        ).properties(height=220).interactive(),
-        use_container_width=True
-    )
+    ycol = "v_base" if "v_base" in dfc.columns else (cols[0] if cols else None)
+    if ycol is not None and "t_min" in dfc.columns:
+        st.altair_chart(
+            alt.Chart(dfc.dropna(subset=[ycol]))
+            .mark_line()
+            .encode(
+                x=alt.X("t_min:Q", title="време [min]"),
+                y=alt.Y(f"{ycol}:Q", title="v (eq or eq_cs) [km/h]"),
+            )
+            .properties(height=220)
+            .interactive(),
+            use_container_width=True
+        )
+    else:
+        st.info("Няма достатъчно данни за CS графика.")
 
+
+# -----------------------------
+# Tab: UI zones (from intensity)
+# -----------------------------
 with tabs[3]:
     ztab = (
         seg.groupby("zone_u", dropna=False)
@@ -422,19 +474,41 @@ with tabs[3]:
     ztab["dist_km"] = ztab["dist_m"] / 1000.0
     st.dataframe(ztab[["zone_u", "time_min", "dist_km", "v_mean", "load"]], use_container_width=True)
 
-    if "hr_zone_ranked" in seg.columns:
-        st.subheader("HR zone ranked (ако го има в DB)")
-        htab = (
-            seg.groupby("hr_zone_ranked", dropna=False)
-            .agg(time_s=("dt_s", "sum"), mean_hr=("hr_mean", "mean"))
-            .reset_index()
-        )
-        htab["time_min"] = htab["time_s"] / 60.0
-        st.dataframe(htab[["hr_zone_ranked", "time_min", "mean_hr"]], use_container_width=True)
 
+# -----------------------------
+# Tab: Zones + HR (from DB columns: zone, hr_zone_ranked)
+# -----------------------------
 with tabs[4]:
-    show_cols = [c for c in [
-        "seg_idx","t_start","dt_s","d_m","slope_pct","v_kmh_raw","v_glide","k_glide",
-        "v_flat_eq","v_flat_eq_cs","zone","hr_zone_ranked","hr_mean","valid_basic","speed_spike"
-    ] if c in seg.columns]
-    st.dataframe(seg[show_cols], use_container_width=True)
+    st.subheader("Зони от DB (zone) и HR-зони (hr_zone_ranked)")
+    cols_needed = ["seg_idx", "dt_s", "d_m", "zone", "hr_zone_ranked", "hr_mean", "v_flat_eq", "v_flat_eq_cs"]
+    cols_exist = [c for c in cols_needed if c in seg.columns]
+
+    if "zone" not in seg.columns and "hr_zone_ranked" not in seg.columns:
+        st.info("Тази активност няма записани zone / hr_zone_ranked в activity_segments (вероятно още не са изчислени в pipeline-а).")
+    else:
+        dfz = seg[cols_exist].copy()
+
+        if "zone" in dfz.columns:
+            z1 = (
+                dfz.groupby("zone", dropna=False)
+                .agg(time_s=("dt_s", "sum"), dist_m=("d_m", "sum"), hr_mean=("hr_mean", "mean"))
+                .reset_index()
+            )
+            z1["time_min"] = z1["time_s"] / 60.0
+            z1["dist_km"] = z1["dist_m"] / 1000.0
+            st.markdown("**Speed zones (zone)**")
+            st.dataframe(z1, use_container_width=True)
+
+        if "hr_zone_ranked" in dfz.columns:
+            z2 = (
+                dfz.groupby("hr_zone_ranked", dropna=False)
+                .agg(time_s=("dt_s", "sum"), dist_m=("d_m", "sum"), hr_mean=("hr_mean", "mean"))
+                .reset_index()
+            )
+            z2["time_min"] = z2["time_s"] / 60.0
+            z2["dist_km"] = z2["dist_m"] / 1000.0
+            st.markdown("**HR ranked zones (hr_zone_ranked)**")
+            st.dataframe(z2, use_container_width=True)
+
+        st.markdown("**Raw segments (preview)**")
+        st.dataframe(dfz.head(200), use_container_width=True)
