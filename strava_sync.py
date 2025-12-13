@@ -206,7 +206,7 @@ def get_last_n_activity_ids_excluding(
     user_id: int,
     sport_group: str,
     exclude_activity_id: int,
-    n: int = 30
+    n: int = 30,
 ) -> list[int]:
     # take a bit more then filter
     res = (
@@ -219,7 +219,11 @@ def get_last_n_activity_ids_excluding(
         .execute()
     )
     rows = res.data or []
-    ids = [r["id"] for r in rows if r.get("id") is not None and r["id"] != exclude_activity_id]
+    ids = [
+        r["id"]
+        for r in rows
+        if r.get("id") is not None and r["id"] != exclude_activity_id
+    ]
     return ids[:n]
 
 
@@ -396,7 +400,46 @@ def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, 
 
 
 # -------------------------------------------------
-# Supabase: UPSERT 30s segments (IDEMPOTENT)
+# Supabase write helpers (robust idempotent)
+# -------------------------------------------------
+def _try_upsert_or_fallback_delete_insert(
+    table_name: str,
+    rows: list[dict],
+    upsert_on_conflict: str | None,
+    delete_filter: dict,
+) -> None:
+    """
+    Supabase upsert requires a UNIQUE constraint/index on the on_conflict columns.
+    If schema doesn't have it, we fallback to delete+insert (idempotent for the given delete_filter scope).
+    """
+    if not rows:
+        return
+
+    # 1) Try upsert if requested
+    if upsert_on_conflict:
+        try:
+            supabase.table(table_name).upsert(rows, on_conflict=upsert_on_conflict).execute()
+            return
+        except Exception:
+            # fall back below
+            pass
+
+    # 2) Fallback: delete scope then insert
+    q = supabase.table(table_name).delete()
+    for k, v in delete_filter.items():
+        if isinstance(v, (list, tuple, set)):
+            q = q.in_(k, list(v))
+        else:
+            q = q.eq(k, v)
+    q.execute()
+
+    # Insert in chunks
+    for i in range(0, len(rows), 1000):
+        supabase.table(table_name).insert(rows[i:i + 1000]).execute()
+
+
+# -------------------------------------------------
+# Supabase: WRITE 30s segments (IDEMPOTENT)
 # -------------------------------------------------
 def insert_segments_30s(
     user_id: int,
@@ -426,7 +469,7 @@ def insert_segments_30s(
     df["user_id"] = user_id
     df["sport_group"] = sport_group
     df["activity_id"] = activity_id
-    df["segment_seconds"] = segment_seconds
+    df["segment_seconds"] = int(segment_seconds)
     df["model_key"] = model_key
 
     for col in ["t_start", "t_end"]:
@@ -439,20 +482,25 @@ def insert_segments_30s(
         ["user_id", "sport_group", "activity_id", "segment_seconds", "model_key"] + wanted
     ].to_dict(orient="records")
 
-    total = 0
-    for i in range(0, len(rows), 1000):
-        chunk = rows[i:i + 1000]
-        supabase.table("activity_segments").upsert(
-            chunk,
-            on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
-        ).execute()
-        total += len(chunk)
+    # Prefer upsert if you have UNIQUE(activity_id, sport_group, segment_seconds, seg_idx, model_key)
+    # Otherwise fallback delete+insert.
+    _try_upsert_or_fallback_delete_insert(
+        table_name="activity_segments",
+        rows=rows,
+        upsert_on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
+        delete_filter={
+            "activity_id": activity_id,
+            "sport_group": sport_group,
+            "segment_seconds": int(segment_seconds),
+            "model_key": model_key,
+        },
+    )
 
-    return total
+    return len(rows)
 
 
 # -------------------------------------------------
-# Supabase: UPSERT 7s segments (ski glide training history)
+# Supabase: WRITE 7s segments (ski glide training history)
 # -------------------------------------------------
 def insert_segments_7s(
     user_id: int,
@@ -489,16 +537,20 @@ def insert_segments_7s(
         ["user_id", "activity_id", "sport_group", "model_key"] + wanted
     ].to_dict(orient="records")
 
-    total = 0
-    for i in range(0, len(rows), 1000):
-        chunk = rows[i:i + 1000]
-        supabase.table("activity_segments_7s").upsert(
-            chunk,
-            on_conflict="activity_id,seg_idx,model_key",
-        ).execute()
-        total += len(chunk)
+    # Prefer upsert if you have UNIQUE(activity_id, seg_idx, model_key) (optionally +sport_group)
+    # Otherwise fallback delete+insert.
+    _try_upsert_or_fallback_delete_insert(
+        table_name="activity_segments_7s",
+        rows=rows,
+        upsert_on_conflict="activity_id,seg_idx,model_key",
+        delete_filter={
+            "activity_id": activity_id,
+            "sport_group": "ski",
+            "model_key": model_key,
+        },
+    )
 
-    return total
+    return len(rows)
 
 
 # -------------------------------------------------
@@ -542,7 +594,8 @@ def sync_and_process_from_strava(
             continue
 
         streams = fetch_activity_streams(access_token, act["id"])
-        streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
+        # normalize to: {key: {"data": [...]}}
+        streams_norm = {k: {"data": (v.get("data", []) if isinstance(v, dict) else [])} for k, v in (streams or {}).items()}
 
         params = params_by_sport[sport_group]
         params_proc = dict(params)
@@ -556,7 +609,7 @@ def sync_and_process_from_strava(
             n=30,
         )
 
-        # --- RUN/WALK rolling slope
+        # --- RUN/WALK rolling slope (30s)
         if sport_group in ("run", "walk"):
             train30 = fetch_training_segments_30s(
                 activity_ids=train_ids,
@@ -614,7 +667,7 @@ def sync_and_process_from_strava(
             )
 
             # store 7s for future rolling glide
-            insert_segments_7s(
+            total_segments += insert_segments_7s(
                 user_id=athlete_id,
                 activity_id=local_activity_id,
                 seg7_df=seg7,
@@ -636,4 +689,3 @@ def sync_and_process_from_strava(
             continue
 
     return new_acts, total_segments
-
