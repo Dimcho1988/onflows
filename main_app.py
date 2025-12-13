@@ -5,6 +5,8 @@ from strava_sync import (
     exchange_code_for_tokens,
     sync_and_process_from_strava,
 )
+from run_walk_pipeline import process_run_walk_activity
+from ski_pipeline import process_ski_activity_30s
 
 
 def get_token_info():
@@ -53,9 +55,6 @@ st.success(
     f"(athlete_id={user_id})"
 )
 
-# -------------------------------------------------
-# Sidebar parameters
-# -------------------------------------------------
 st.sidebar.header("Параметри")
 
 st.sidebar.subheader("Ski")
@@ -111,24 +110,12 @@ params_by_sport = {
     ),
 }
 
-# -------------------------------------------------
-# Action
-# -------------------------------------------------
 if st.button("Sync + Process + Save (no streams)"):
-    try:
-        # LAZY imports so we can display real error
-        from run_walk_pipeline import process_run_walk_activity
-        from ski_pipeline import process_ski_activity_30s
-
-        new_acts, total_segments = sync_and_process_from_strava(
-            token_info=token_info,
-            process_ski_activity_30s=process_ski_activity_30s,
-            process_run_walk_activity=process_run_walk_activity,
-            params_by_sport=params_by_sport,
-            days_back_if_empty=int(days_back),
-        )
-        st.success(f"Готово. Активности: {new_acts}, записани сегменти: {total_segments}")
-
-    except Exception as e:
-        st.error("Грешка при import/processing. Ето пълния traceback:")
-        st.exception(e)
+    new_acts, total_segments = sync_and_process_from_strava(
+        token_info=token_info,
+        process_ski_activity_30s=process_ski_activity_30s,
+        process_run_walk_activity=process_run_walk_activity,
+        params_by_sport=params_by_sport,
+        days_back_if_empty=int(days_back),
+    )
+    st.success(f"Готово. Активности: {new_acts}, записани сегменти: {total_segments}")
