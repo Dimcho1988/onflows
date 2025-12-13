@@ -181,6 +181,9 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
     return data[0]["id"]
 
 
+# -------------------------------------------------
+# Rolling window: last N activities (<=30), excluding current
+# -------------------------------------------------
 def get_last_n_activity_ids_excluding(
     user_id: int,
     sport_group: str,
@@ -193,11 +196,15 @@ def get_last_n_activity_ids_excluding(
         .eq("user_id", user_id)
         .eq("sport_group", sport_group)
         .order("start_date", desc=True)
-        .limit(n + 10)
+        .limit(n + 10)  # small buffer for safety
         .execute()
     )
     rows = res.data or []
-    ids = [r["id"] for r in rows if r.get("id") is not None and r["id"] != exclude_activity_id]
+    ids = [
+        int(r["id"])
+        for r in rows
+        if r.get("id") is not None and int(r["id"]) != int(exclude_activity_id)
+    ]
     return ids[:n]
 
 
@@ -224,7 +231,7 @@ def fetch_training_segments_30s(
     if df.empty:
         return df
 
-    for c in ["slope_pct", "v_kmh_raw", "v_glide", "k_glide", "dt_s", "d_m", "hr_mean"]:
+    for c in ["slope_pct", "v_kmh_raw", "v_glide", "k_glide", "dt_s", "d_m", "hr_mean", "v_flat_eq"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ["valid_basic", "speed_spike"]:
@@ -264,6 +271,9 @@ def fetch_training_segments_7s(
     return df
 
 
+# -------------------------------------------------
+# Fit helpers (from training segments)
+# -------------------------------------------------
 def fit_run_walk_slope_poly_from_segments(train_seg: pd.DataFrame):
     from run_walk_pipeline import fit_slope_poly
 
@@ -272,8 +282,8 @@ def fit_run_walk_slope_poly_from_segments(train_seg: pd.DataFrame):
 
     df = train_seg.copy()
     m = (
-        df["valid_basic"]
-        & (~df["speed_spike"])
+        df["valid_basic"].fillna(True)
+        & (~df["speed_spike"].fillna(False))
         & df["slope_pct"].between(-15.0, 15.0)
         & (df["v_kmh_raw"] > 3.0)
         & (df["v_kmh_raw"] < 30.0)
@@ -309,11 +319,12 @@ def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, 
         return None
 
     df = train30.copy()
-    df = df[df["valid_basic"] & (~df["speed_spike"])].copy()
+    df = df[df["valid_basic"].fillna(True) & (~df["speed_spike"].fillna(False))].copy()
     df = df.dropna(subset=["slope_pct", "v_kmh_raw"])
     if df.empty:
         return None
 
+    # approximate per-activity K_glide using glide_poly if available
     if glide_poly_for_training is not None:
         k_map = {}
         m_down = (df["slope_pct"] <= -5.0)
@@ -347,6 +358,9 @@ def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, 
     return fit_slope_poly(slope_train)
 
 
+# -------------------------------------------------
+# Inserts
+# -------------------------------------------------
 def insert_segments_30s(
     user_id: int,
     sport_group: str,
@@ -447,6 +461,9 @@ def insert_segments_7s(
     return total
 
 
+# -------------------------------------------------
+# Main sync
+# -------------------------------------------------
 def sync_and_process_from_strava(
     token_info: dict,
     process_ski_activity_30s,
@@ -491,6 +508,7 @@ def sync_and_process_from_strava(
         params_proc = dict(params)
         model_key = params_proc.pop("model_key", "unknown")
 
+        # rolling window: use as many previous activities as exist (up to 30)
         train_ids = get_last_n_activity_ids_excluding(
             user_id=athlete_id,
             sport_group=sport_group,
@@ -498,6 +516,9 @@ def sync_and_process_from_strava(
             n=30,
         )
 
+        # -------------------------
+        # RUN/WALK
+        # -------------------------
         if sport_group in ("run", "walk"):
             train30 = fetch_training_segments_30s(
                 activity_ids=train_ids,
@@ -505,6 +526,9 @@ def sync_and_process_from_strava(
                 segment_seconds=30,
                 model_key=model_key,
             )
+
+            # If we have 0 training activities or no training segments, slope_poly_global becomes None
+            # and the pipeline will fit from the current activity (fallback).
             slope_poly_global = fit_run_walk_slope_poly_from_segments(train30)
 
             seg30 = process_run_walk_activity(
@@ -526,6 +550,9 @@ def sync_and_process_from_strava(
             time.sleep(0.25)
             continue
 
+        # -------------------------
+        # SKI
+        # -------------------------
         if sport_group == "ski":
             train7 = fetch_training_segments_7s(train_ids, model_key=model_key)
             glide_poly_global = fit_glide_poly_from_7s(train7)
