@@ -5,53 +5,93 @@ import numpy as np
 def tau_of_delta(delta_v, tmin, k, q):
     """
     τ(Δv) = τ_min + k * (Δv)^q
-    delta_v в km/h
+
+    Parameters
+    ----------
+    delta_v : array-like or float
+        Δv in km/h (we use max(delta_v, 0))
+    tmin : float
+        τ_min [s]
+    k : float
+        k parameter
+    q : float
+        q exponent
+
+    Returns
+    -------
+    np.ndarray or float
+        τ in seconds (same shape as delta_v)
     """
     delta_v = np.maximum(np.asarray(delta_v, dtype=float), 0.0)
+    tmin = float(tmin)
+    k = float(k)
+    q = float(q)
     return tmin + k * (delta_v ** q)
 
 
 def predict_t90_for_reference(CS, ref_percent, tmin, k, q):
     """
-    При постоянна скорост v = ref_percent * CS:
-    t90 ≈ 2.303 * τ(Δv_ref)
+    For constant speed v = ref_percent * CS:
+      t90 ≈ 2.303 * τ(Δv_ref)
+
+    Returns
+    -------
+    dv_ref : float
+    tau_ref : float
+    t90_est : float
     """
+    CS = float(CS)
+    ref_percent = float(ref_percent)
     dv_ref = (ref_percent / 100.0 - 1.0) * CS
-    tau_ref = tau_of_delta(dv_ref, tmin, k, q)
+    tau_ref = float(tau_of_delta(dv_ref, tmin, k, q))
     t90_est = 2.303 * tau_ref
     return dv_ref, tau_ref, t90_est
 
 
 def calibrate_k_for_target_t90(CS, ref_percent, tmin, q, target_t90):
     """
-    Намира k така, че t90 при v = ref_percent * CS да е target_t90.
-    Формула от t90 = 2.303 * (tmin + k * (Δv_ref)^q).
+    Find k so that t90 at v = ref_percent * CS equals target_t90:
+      t90 = 2.303 * (tmin + k * (Δv_ref)^q)
     """
+    CS = float(CS)
+    ref_percent = float(ref_percent)
+    tmin = float(tmin)
+    q = float(q)
+    target_t90 = float(target_t90)
+
     dv_ref = (ref_percent / 100.0 - 1.0) * CS
-    dvq = max(dv_ref, 0.0) ** q if dv_ref > 0 else 0.0
+    if dv_ref <= 0:
+        return 0.0
+
+    dvq = (dv_ref ** q) if dv_ref > 0 else 0.0
     tau_ref_needed = target_t90 / 2.303
 
     if dvq <= 0:
         return 0.0
 
-    k_needed = max(0.0, (tau_ref_needed - tmin) / dvq)
-    return k_needed
+    k_needed = (tau_ref_needed - tmin) / dvq
+    return float(max(0.0, k_needed))
 
 
 def apply_cs_modulation(v, dt, CS, tau_min, k_par, q_par, gamma):
     """
-    Основен CS модел:
+    CS modulation model.
 
-    вход:
-      v  – скорост [km/h] (np.array)
-      dt – стъпка по време за всеки елемент [s] (np.array)
-      CS, tau_min, k_par, q_par, gamma – параметри на модела
+    Inputs
+    ------
+    v  : np.array
+        speed [km/h]
+    dt : np.array
+        time step per sample [s]
+    CS, tau_min, k_par, q_par, gamma : float
+        model params
 
-    връща dict с:
-      v_mod         – модулирана скорост [km/h]
-      delta_v_plus  – Δv⁺ = max(v - CS, 0)
-      r             – „повдигане“ на скоростта [km/h]
-      tau_s         – ефективна τ(t) [s]
+    Returns dict
+    ------------
+    v_mod         : np.array  (v + gamma*r)
+    delta_v_plus  : np.array  max(v - CS, 0)
+    r             : np.array  "lift" [km/h]
+    tau_s         : np.array  effective tau [s]
     """
     v = np.asarray(v, dtype=float)
     dt = np.asarray(dt, dtype=float)
@@ -59,39 +99,40 @@ def apply_cs_modulation(v, dt, CS, tau_min, k_par, q_par, gamma):
     if v.shape != dt.shape:
         raise ValueError("v и dt трябва да са с еднаква дължина.")
 
-    # гаранция за положителни dt
+    CS = float(CS)
+    tau_min = float(tau_min)
+    k_par = float(k_par)
+    q_par = float(q_par)
+    gamma = float(gamma)
+
+    # safety: non-negative dt
     dt = np.maximum(dt, 1e-6)
 
     delta_v_plus = np.maximum(v - CS, 0.0)
 
-    A = np.zeros_like(v)          # натрупан „дълг“
-    r = np.zeros_like(v)          # повдигане
+    A = np.zeros_like(v)          # accumulated "debt"
+    r = np.zeros_like(v)          # lift
     tau_series = np.zeros_like(v)
 
-    tau_last = tau_min
+    tau_last = max(tau_min, 1e-6)
 
     for i in range(len(v)):
         dvp = delta_v_plus[i]
+
         if dvp > 0:
-            tau_i = tau_of_delta(dvp, tau_min, k_par, q_par)
-            tau_last = tau_i
+            tau_i = float(tau_of_delta(dvp, tau_min, k_par, q_par))
+            tau_last = max(tau_i, 1e-6)
         else:
             tau_i = tau_last
 
         tau_series[i] = tau_i
 
-        decay = np.exp(-dt[i] / tau_i)
-        if i == 0:
-            A_prev = 0.0
-        else:
-            A_prev = A[i - 1]
+        decay = float(np.exp(-dt[i] / tau_i))
+        A_prev = 0.0 if i == 0 else float(A[i - 1])
 
         A[i] = A_prev * decay + dvp * dt[i]
 
-        if dt[i] > 0:
-            r[i] = (1.0 - decay) * A[i] / dt[i]
-        else:
-            r[i] = 0.0
+        r[i] = (1.0 - decay) * A[i] / dt[i] if dt[i] > 0 else 0.0
 
     v_mod = v + gamma * r
 
