@@ -1,3 +1,4 @@
+# visualization_app.py
 import pandas as pd
 import numpy as np
 import altair as alt
@@ -55,15 +56,16 @@ def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
-# Fit slope poly from last-30 RAW segments (NO model_key filter)
+# Fit slope poly from last-30 ACTIVITIES (NOT last-30 segments)
 # -----------------------------
 def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
     """
-    Fit F_raw(s) from segments:
-      V0 = mean(v_raw) on near-flat slopes [-1,1]
-      F_raw = V0 / v_raw
-      polyfit(F_raw vs slope)
-      shift so F(0)=1
+    LAST-30 ACTIVITIES slope fit (run/walk style):
+
+    1) V0 from FLAT segments only: |slope| <= 1
+    2) Fit F_raw = V0 / v_raw using NON-FLAT segments only: |slope| > 1
+       and slope in [-15, +15], v_raw in [3,30], valid_basic True, speed_spike False
+    3) Shift to enforce F(0)=1
     Returns np.poly1d or None.
     """
     if seg_df is None or seg_df.empty:
@@ -74,34 +76,42 @@ def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
     if df.empty:
         return None
 
-    # basic filters similar to pipeline
-    m = (
+    # base filter
+    base = (
         df["valid_basic"].fillna(True)
         & (~df["speed_spike"].fillna(False))
         & df["slope_pct"].between(-15.0, 15.0)
         & (df["v_kmh_raw"] > 3.0)
         & (df["v_kmh_raw"] < 30.0)
     )
-    df = df.loc[m, ["slope_pct", "v_kmh_raw"]].copy()
-    if len(df) < 10:
+    df = df.loc[base, ["slope_pct", "v_kmh_raw"]].copy()
+    if len(df) < 12:
         return None
 
-    V0 = df.loc[df["slope_pct"].between(-1.0, 1.0), "v_kmh_raw"].mean()
+    # 1) V0 from FLAT only
+    flat = df.loc[df["slope_pct"].abs() <= 1.0, "v_kmh_raw"]
+    if flat.empty:
+        return None
+    V0 = float(flat.mean())
     if not np.isfinite(V0) or V0 <= 0:
         return None
 
-    df["F_raw"] = V0 / df["v_kmh_raw"]
-    x = df["slope_pct"].to_numpy(dtype=float)
-    y = df["F_raw"].to_numpy(dtype=float)
-
-    if len(x) <= deg + 2:
+    # 2) Fit ONLY on NON-FLAT data
+    df_fit = df.loc[df["slope_pct"].abs() > 1.0].copy()
+    if len(df_fit) <= deg + 4:
         return None
+
+    df_fit["F_raw"] = V0 / df_fit["v_kmh_raw"]
+    x = df_fit["slope_pct"].to_numpy(dtype=float)
+    y = df_fit["F_raw"].to_numpy(dtype=float)
 
     coeffs = np.polyfit(x, y, deg)
     raw_poly = np.poly1d(coeffs)
 
-    # shift to enforce F(0)=1
+    # 3) shift F(0)=1
     F0 = float(raw_poly(0.0))
+    if not np.isfinite(F0):
+        return None
     offset = F0 - 1.0
     coeffs_corr = raw_poly.coefficients.copy()
     coeffs_corr[-1] -= offset
@@ -109,14 +119,6 @@ def fit_slope_poly_last30(seg_df: pd.DataFrame, deg: int = 2):
 
 
 def apply_shape_constraints(F: np.ndarray, slopes: np.ndarray, fmin=0.7, fmax=1.7, alpha=1.0):
-    """
-    Same style constraints as pipeline:
-      clip to [fmin,fmax]
-      |s|<=1 -> 1
-      downhills -> <=1
-      uphills -> >=1
-      alpha scaling around 1
-    """
     slopes = np.asarray(slopes, dtype=float)
     F = np.asarray(F, dtype=float)
 
@@ -189,8 +191,10 @@ def fetch_segments(activity_id: int, sport_group: str, segment_seconds: int, mod
     df["t_start"] = df["t_start"].apply(to_utc_dt)
     df["t_end"] = df["t_end"].apply(to_utc_dt)
 
-    for c in ["dt_s", "d_m", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "hr_mean",
-              "delta_v_plus_kmh", "r_kmh", "tau_s", "k_glide", "v_glide"]:
+    for c in [
+        "dt_s", "d_m", "slope_pct", "v_kmh_raw", "v_flat_eq", "v_flat_eq_cs", "hr_mean",
+        "delta_v_plus_kmh", "r_kmh", "tau_s", "k_glide", "v_glide"
+    ]:
         if c in df.columns:
             df[c] = df[c].apply(safe_float)
 
@@ -202,30 +206,42 @@ def fetch_segments(activity_id: int, sport_group: str, segment_seconds: int, mod
 
 
 @st.cache_data(ttl=30)
-def fetch_last30_segments_for_fit_raw(
+def fetch_last30_segments_for_fit(
     user_id: int,
     sport_group: str,
     segment_seconds: int,
-    n_acts: int = 30
-) -> tuple[pd.DataFrame, list[int]]:
+    model_key: str,
+    n_acts: int = 30,
+    exclude_activity_id: int | None = None,
+) -> pd.DataFrame:
     """
-    ВАЖНО: Това е RAW last-30 fit (без model_key филтър).
-    Взима последните 30 активности по sport_group и после всички сегменти (RAW) за тях
-    по sport_group + segment_seconds.
-    Връща (df_segments, activity_ids_used)
+    IMPORTANT: last 30 ACTIVITIES (not segments).
+    Optionally exclude the currently selected activity_id.
     """
+    # fetch more, then exclude + trim
     res = (
         supabase.table("activities")
-        .select("id")
+        .select("id,start_date")
         .eq("user_id", user_id)
         .eq("sport_group", sport_group)
         .order("start_date", desc=True)
-        .limit(n_acts)
+        .limit(n_acts + 10)
         .execute()
     )
-    ids = [r["id"] for r in (res.data or []) if r.get("id") is not None]
+    rows = res.data or []
+    ids = []
+    for r in rows:
+        aid = r.get("id")
+        if aid is None:
+            continue
+        if exclude_activity_id is not None and int(aid) == int(exclude_activity_id):
+            continue
+        ids.append(int(aid))
+        if len(ids) >= n_acts:
+            break
+
     if not ids:
-        return pd.DataFrame(), []
+        return pd.DataFrame()
 
     res2 = (
         supabase.table("activity_segments")
@@ -233,11 +249,12 @@ def fetch_last30_segments_for_fit_raw(
         .in_("activity_id", ids)
         .eq("sport_group", sport_group)
         .eq("segment_seconds", segment_seconds)
+        .eq("model_key", model_key)
         .execute()
     )
     df = pd.DataFrame(res2.data or [])
     if df.empty:
-        return df, ids
+        return df
 
     for c in ["slope_pct", "v_kmh_raw"]:
         if c in df.columns:
@@ -246,14 +263,14 @@ def fetch_last30_segments_for_fit_raw(
         if c in df.columns:
             df[c] = df[c].fillna(False).astype(bool)
 
-    return df, ids
+    return df
 
 
 # -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="onFlows – Visualization", layout="wide")
-st.title("onFlows – Visualization (RAW last-30 regression curve)")
+st.title("onFlows – Visualization (last-30 ACTIVITIES regression curve)")
 
 init_clients(st)
 
@@ -269,7 +286,8 @@ with st.sidebar:
 
     st.subheader("Slope regression display")
     alpha_slope_viz = st.slider("alpha_slope (display)", 0.0, 2.0, 1.0, 0.05)
-    show_last30_curve = st.checkbox("Show RAW last-30 fitted curve", value=True)
+    show_last30_curve = st.checkbox("Show last-30 fitted curve", value=True)
+    exclude_current_from_last30 = st.checkbox("Exclude current activity from last-30", value=True)
 
 acts = fetch_activities(int(user_id))
 if acts.empty:
@@ -332,7 +350,6 @@ c4.metric("model_key", model_key)
 
 tabs = st.tabs(["Приравняване", "Модели (slope/glide)", "CS модулатор", "Зони + натоварване"])
 
-
 # -----------------------------
 # Tab: Models
 # -----------------------------
@@ -349,7 +366,7 @@ with tabs[1]:
     dfm = seg.loc[m, ["slope_pct", "v_kmh_raw", base_col]].copy()
     dfm["F_implied"] = dfm[base_col] / dfm["v_kmh_raw"]
 
-    st.subheader("Наклонен модел (точки + RAW last-30 регресионна крива)")
+    st.subheader("Наклонен модел (точки + last-30 ACTIVITIES регресионна крива)")
 
     scat = (
         alt.Chart(dfm)
@@ -365,24 +382,18 @@ with tabs[1]:
 
     line = None
     if show_last30_curve:
-        train_last30, ids_used = fetch_last30_segments_for_fit_raw(
+        train_last30 = fetch_last30_segments_for_fit(
             user_id=int(user_id),
             sport_group=sport_group,
             segment_seconds=seg_seconds,
+            model_key=model_key,
             n_acts=30,
-        )
-
-        st.caption(
-            f"RAW last-30 set: activities_used={len(ids_used)} (target=30), "
-            f"segments_fetched={len(train_last30)} (sport={sport_group}, seg={seg_seconds}s, NO model_key filter)"
+            exclude_activity_id=(activity_id if exclude_current_from_last30 else None),
         )
 
         poly = fit_slope_poly_last30(train_last30, deg=2)
         if poly is None:
-            st.warning(
-                "Не успях да fit-на регресия от RAW last-30. "
-                "Причина обикновено е: малко валидни сегменти, липса на flat сегменти (-1..1%), или твърде много spikes."
-            )
+            st.warning("Не успях да fit-на регресия от last-30 activities (липсват flat сегменти за V0 или има малко валидни данни).")
         else:
             s_grid = np.linspace(-15, 15, 241)
             F_grid = poly(s_grid)
@@ -399,13 +410,15 @@ with tabs[1]:
                 )
             )
 
-            st.caption(f"RAW last-30 fit: poly deg=2 (shifted to F(0)=1), then clipped + alpha={alpha_slope_viz:.2f}")
+            st.caption(
+                f"Last-30 ACTIVITIES fit: V0 from |slope|<=1%, fit on |slope|>1% (deg=2, shifted to F(0)=1), "
+                f"then clipped + alpha={alpha_slope_viz:.2f}."
+            )
 
     if line is not None:
         st.altair_chart(scat + line, use_container_width=True)
     else:
         st.altair_chart(scat, use_container_width=True)
-
 
 # -----------------------------
 # Other tabs (minimal)
