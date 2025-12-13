@@ -18,9 +18,6 @@ STRAVA_CLIENT_SECRET = None
 supabase: Client | None = None
 
 
-# -------------------------------------------------
-# Init clients from Streamlit secrets
-# -------------------------------------------------
 def init_clients(st_app):
     global SUPABASE_URL, SUPABASE_KEY
     global STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET
@@ -35,9 +32,6 @@ def init_clients(st_app):
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# -------------------------------------------------
-# OAuth helpers
-# -------------------------------------------------
 def exchange_code_for_tokens(auth_code: str) -> dict:
     token_url = "https://www.strava.com/oauth/token"
 
@@ -78,9 +72,6 @@ def get_strava_access_token(refresh_token: str) -> str:
     return resp.json()["access_token"]
 
 
-# -------------------------------------------------
-# Strava API
-# -------------------------------------------------
 def fetch_activities_since(access_token: str, after_ts: int) -> list[dict]:
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -117,9 +108,6 @@ def fetch_activity_streams(access_token: str, strava_activity_id: int) -> dict:
     return r.json()
 
 
-# -------------------------------------------------
-# Sport mapping
-# -------------------------------------------------
 def map_sport_group(strava_sport_type: str | None) -> str | None:
     ski_types = {"NordicSki", "BackcountrySki", "RollerSki"}
     run_types = {"Run", "TrailRun"}
@@ -134,9 +122,6 @@ def map_sport_group(strava_sport_type: str | None) -> str | None:
     return None
 
 
-# -------------------------------------------------
-# Incremental sync helper (SAFE)
-# -------------------------------------------------
 def get_last_activity_start_date(user_id: int):
     try:
         res = (
@@ -157,9 +142,6 @@ def get_last_activity_start_date(user_id: int):
         return None
 
 
-# -------------------------------------------------
-# Supabase: upsert activity summary
-# -------------------------------------------------
 def upsert_activity_summary(act: dict, user_id: int) -> int | None:
     sport_group = map_sport_group(act.get("sport_type"))
     if sport_group is None:
@@ -199,16 +181,12 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
     return data[0]["id"]
 
 
-# -------------------------------------------------
-# Rolling training set: last N activities per sport (excluding current)
-# -------------------------------------------------
 def get_last_n_activity_ids_excluding(
     user_id: int,
     sport_group: str,
     exclude_activity_id: int,
-    n: int = 30,
+    n: int = 30
 ) -> list[int]:
-    # take a bit more then filter
     res = (
         supabase.table("activities")
         .select("id")
@@ -219,17 +197,10 @@ def get_last_n_activity_ids_excluding(
         .execute()
     )
     rows = res.data or []
-    ids = [
-        r["id"]
-        for r in rows
-        if r.get("id") is not None and r["id"] != exclude_activity_id
-    ]
+    ids = [r["id"] for r in rows if r.get("id") is not None and r["id"] != exclude_activity_id]
     return ids[:n]
 
 
-# -------------------------------------------------
-# Fetch training segments (30s) from DB
-# -------------------------------------------------
 def fetch_training_segments_30s(
     activity_ids: list[int],
     sport_group: str,
@@ -253,7 +224,7 @@ def fetch_training_segments_30s(
     if df.empty:
         return df
 
-    for c in ["slope_pct", "v_kmh_raw", "v_glide", "k_glide", "dt_s", "d_m"]:
+    for c in ["slope_pct", "v_kmh_raw", "v_glide", "k_glide", "dt_s", "d_m", "hr_mean"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ["valid_basic", "speed_spike"]:
@@ -263,9 +234,6 @@ def fetch_training_segments_30s(
     return df
 
 
-# -------------------------------------------------
-# Fetch training segments (7s) from DB (ski only)
-# -------------------------------------------------
 def fetch_training_segments_7s(
     activity_ids: list[int],
     model_key: str,
@@ -296,14 +264,7 @@ def fetch_training_segments_7s(
     return df
 
 
-# -------------------------------------------------
-# Fit rolling models from DB
-# -------------------------------------------------
 def fit_run_walk_slope_poly_from_segments(train_seg: pd.DataFrame):
-    """
-    Fit slope polynomial F(s) from rolling segments (run/walk).
-    Returns np.poly1d or None.
-    """
     from run_walk_pipeline import fit_slope_poly
 
     if train_seg is None or train_seg.empty:
@@ -331,11 +292,6 @@ def fit_run_walk_slope_poly_from_segments(train_seg: pd.DataFrame):
 
 
 def fit_glide_poly_from_7s(train7: pd.DataFrame):
-    """
-    Fit glide polynomial v_model(slope) from rolling 7s segments (ski).
-    Uses consecutive downhills rule (get_glide_training_segments).
-    Returns np.poly1d or None.
-    """
     from ski_pipeline import get_glide_training_segments, fit_glide_poly
 
     if train7 is None or train7.empty:
@@ -347,12 +303,6 @@ def fit_glide_poly_from_7s(train7: pd.DataFrame):
 
 
 def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, damp_glide: float):
-    """
-    Fit ski slope polynomial F(s) using rolling 30s segments.
-    Builds temporary v_glide_tmp using per-activity k_glide derived from glide_poly_for_training (optional),
-    then fits slope using ski_pipeline.get_slope_training_data_out + fit_slope_poly.
-    Returns np.poly1d or None.
-    """
     from ski_pipeline import get_slope_training_data_out, fit_slope_poly
 
     if train30 is None or train30.empty:
@@ -364,8 +314,6 @@ def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, 
     if df.empty:
         return None
 
-    # If we have a rolling glide_poly, build per-activity k_glide from 30s downhills (approx) for training v_glide_tmp.
-    # NOTE: true glide training is 7s; here we only want a reasonable v_glide base for slope training.
     if glide_poly_for_training is not None:
         k_map = {}
         m_down = (df["slope_pct"] <= -5.0)
@@ -399,48 +347,6 @@ def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, 
     return fit_slope_poly(slope_train)
 
 
-# -------------------------------------------------
-# Supabase write helpers (robust idempotent)
-# -------------------------------------------------
-def _try_upsert_or_fallback_delete_insert(
-    table_name: str,
-    rows: list[dict],
-    upsert_on_conflict: str | None,
-    delete_filter: dict,
-) -> None:
-    """
-    Supabase upsert requires a UNIQUE constraint/index on the on_conflict columns.
-    If schema doesn't have it, we fallback to delete+insert (idempotent for the given delete_filter scope).
-    """
-    if not rows:
-        return
-
-    # 1) Try upsert if requested
-    if upsert_on_conflict:
-        try:
-            supabase.table(table_name).upsert(rows, on_conflict=upsert_on_conflict).execute()
-            return
-        except Exception:
-            # fall back below
-            pass
-
-    # 2) Fallback: delete scope then insert
-    q = supabase.table(table_name).delete()
-    for k, v in delete_filter.items():
-        if isinstance(v, (list, tuple, set)):
-            q = q.in_(k, list(v))
-        else:
-            q = q.eq(k, v)
-    q.execute()
-
-    # Insert in chunks
-    for i in range(0, len(rows), 1000):
-        supabase.table(table_name).insert(rows[i:i + 1000]).execute()
-
-
-# -------------------------------------------------
-# Supabase: WRITE 30s segments (IDEMPOTENT)
-# -------------------------------------------------
 def insert_segments_30s(
     user_id: int,
     sport_group: str,
@@ -458,7 +364,7 @@ def insert_segments_30s(
         "k_glide", "v_glide",
         "v_flat_eq", "v_flat_eq_cs",
         "delta_v_plus_kmh", "r_kmh", "tau_s", "hr_mean",
-        "zone",
+        "zone", "hr_zone_ranked",
     ]
 
     df = seg_df.copy()
@@ -469,7 +375,7 @@ def insert_segments_30s(
     df["user_id"] = user_id
     df["sport_group"] = sport_group
     df["activity_id"] = activity_id
-    df["segment_seconds"] = int(segment_seconds)
+    df["segment_seconds"] = segment_seconds
     df["model_key"] = model_key
 
     for col in ["t_start", "t_end"]:
@@ -482,26 +388,18 @@ def insert_segments_30s(
         ["user_id", "sport_group", "activity_id", "segment_seconds", "model_key"] + wanted
     ].to_dict(orient="records")
 
-    # Prefer upsert if you have UNIQUE(activity_id, sport_group, segment_seconds, seg_idx, model_key)
-    # Otherwise fallback delete+insert.
-    _try_upsert_or_fallback_delete_insert(
-        table_name="activity_segments",
-        rows=rows,
-        upsert_on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
-        delete_filter={
-            "activity_id": activity_id,
-            "sport_group": sport_group,
-            "segment_seconds": int(segment_seconds),
-            "model_key": model_key,
-        },
-    )
+    total = 0
+    for i in range(0, len(rows), 1000):
+        chunk = rows[i:i + 1000]
+        supabase.table("activity_segments").upsert(
+            chunk,
+            on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
+        ).execute()
+        total += len(chunk)
 
-    return len(rows)
+    return total
 
 
-# -------------------------------------------------
-# Supabase: WRITE 7s segments (ski glide training history)
-# -------------------------------------------------
 def insert_segments_7s(
     user_id: int,
     activity_id: int,
@@ -537,28 +435,21 @@ def insert_segments_7s(
         ["user_id", "activity_id", "sport_group", "model_key"] + wanted
     ].to_dict(orient="records")
 
-    # Prefer upsert if you have UNIQUE(activity_id, seg_idx, model_key) (optionally +sport_group)
-    # Otherwise fallback delete+insert.
-    _try_upsert_or_fallback_delete_insert(
-        table_name="activity_segments_7s",
-        rows=rows,
-        upsert_on_conflict="activity_id,seg_idx,model_key",
-        delete_filter={
-            "activity_id": activity_id,
-            "sport_group": "ski",
-            "model_key": model_key,
-        },
-    )
+    total = 0
+    for i in range(0, len(rows), 1000):
+        chunk = rows[i:i + 1000]
+        supabase.table("activity_segments_7s").upsert(
+            chunk,
+            on_conflict="activity_id,seg_idx,model_key",
+        ).execute()
+        total += len(chunk)
 
-    return len(rows)
+    return total
 
 
-# -------------------------------------------------
-# Full sync + process pipeline (rolling models)
-# -------------------------------------------------
 def sync_and_process_from_strava(
     token_info: dict,
-    process_ski_activity_30s,      # must return (seg30, seg7)
+    process_ski_activity_30s,
     process_run_walk_activity,
     params_by_sport: dict,
     days_back_if_empty: int = 200,
@@ -594,14 +485,12 @@ def sync_and_process_from_strava(
             continue
 
         streams = fetch_activity_streams(access_token, act["id"])
-        # normalize to: {key: {"data": [...]}}
-        streams_norm = {k: {"data": (v.get("data", []) if isinstance(v, dict) else [])} for k, v in (streams or {}).items()}
+        streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
 
         params = params_by_sport[sport_group]
         params_proc = dict(params)
         model_key = params_proc.pop("model_key", "unknown")
 
-        # rolling train ids (last 30 of that sport, excluding current)
         train_ids = get_last_n_activity_ids_excluding(
             user_id=athlete_id,
             sport_group=sport_group,
@@ -609,7 +498,6 @@ def sync_and_process_from_strava(
             n=30,
         )
 
-        # --- RUN/WALK rolling slope (30s)
         if sport_group in ("run", "walk"):
             train30 = fetch_training_segments_30s(
                 activity_ids=train_ids,
@@ -638,13 +526,10 @@ def sync_and_process_from_strava(
             time.sleep(0.25)
             continue
 
-        # --- SKI rolling glide(7s) + slope(30s)
         if sport_group == "ski":
-            # glide poly from 7s history
             train7 = fetch_training_segments_7s(train_ids, model_key=model_key)
             glide_poly_global = fit_glide_poly_from_7s(train7)
 
-            # slope poly from 30s history (uses glide_poly only to build v_glide_tmp base)
             train30 = fetch_training_segments_30s(
                 activity_ids=train_ids,
                 sport_group="ski",
@@ -657,7 +542,6 @@ def sync_and_process_from_strava(
                 damp_glide=params_proc.get("DAMP_GLIDE", 1.0),
             )
 
-            # IMPORTANT: ski pipeline must return (seg30, seg7)
             seg30, seg7 = process_ski_activity_30s(
                 act_row={"id": local_activity_id, "start_date": act.get("start_date")},
                 streams=streams_norm,
@@ -666,15 +550,13 @@ def sync_and_process_from_strava(
                 **params_proc,
             )
 
-            # store 7s for future rolling glide
-            total_segments += insert_segments_7s(
+            insert_segments_7s(
                 user_id=athlete_id,
                 activity_id=local_activity_id,
                 seg7_df=seg7,
                 model_key=model_key,
             )
 
-            # store 30s for analysis & rolling slope
             total_segments += insert_segments_30s(
                 user_id=athlete_id,
                 sport_group="ski",
