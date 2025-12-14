@@ -77,6 +77,20 @@ days_back = st.sidebar.number_input(
     "Days back (first sync)", min_value=1, max_value=5000, value=200, step=10
 )
 
+# NEW: Reprocess / overwrite controls
+st.sidebar.subheader("Reprocess")
+force_reprocess = st.sidebar.checkbox(
+    "Force reprocess (overwrite existing segments)",
+    value=False,
+)
+reprocess_last_n = st.sidebar.number_input(
+    "Reprocess last N activities (0 = only new)",
+    min_value=0,
+    max_value=200,
+    value=0,
+    step=5,
+)
+
 params_by_sport = {
     "ski": dict(
         model_key="ski_glide_v3",
@@ -117,5 +131,7 @@ if st.button("Sync + Process + Save (no streams)"):
         process_run_walk_activity=process_run_walk_activity,
         params_by_sport=params_by_sport,
         days_back_if_empty=int(days_back),
+        force_reprocess=bool(force_reprocess),
+        reprocess_last_n=int(reprocess_last_n),
     )
     st.success(f"Готово. Активности: {new_acts}, записани сегменти: {total_segments}")
