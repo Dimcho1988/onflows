@@ -156,7 +156,7 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "name": act.get("name"),
         "sport_type": act.get("sport_type"),
         "sport_group": sport_group,
-        "start_date": start_date,
+        "start_date": act.get("start_date"),
         "timezone": act.get("timezone"),
         "distance_m": act.get("distance"),
         "moving_time_s": act.get("moving_time"),
