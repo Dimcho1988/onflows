@@ -458,12 +458,57 @@ def insert_segments_7s(
     return total
 
 
+# -----------------------------
+# NEW: deletion helpers for overwrite
+# -----------------------------
+def delete_segments_30s(activity_id: int, sport_group: str, segment_seconds: int, model_key: str):
+    supabase.table("activity_segments") \
+        .delete() \
+        .eq("activity_id", int(activity_id)) \
+        .eq("sport_group", str(sport_group)) \
+        .eq("segment_seconds", int(segment_seconds)) \
+        .eq("model_key", str(model_key)) \
+        .execute()
+
+
+def delete_segments_7s(activity_id: int, model_key: str):
+    supabase.table("activity_segments_7s") \
+        .delete() \
+        .eq("activity_id", int(activity_id)) \
+        .eq("model_key", str(model_key)) \
+        .execute()
+
+
+def fetch_last_n_activity_rows_for_reprocess(user_id: int, n: int) -> list[dict]:
+    """
+    Returns last N activities rows from Supabase for reprocess.
+    Needs columns: id (local), strava_activity_id, sport_group, sport_type, start_date
+    """
+    res = (
+        supabase.table("activities")
+        .select("id,strava_activity_id,sport_group,sport_type,start_date")
+        .eq("user_id", int(user_id))
+        .order("start_date", desc=True)
+        .limit(int(n))
+        .execute()
+    )
+    rows = res.data or []
+    out = []
+    for r in rows:
+        if r.get("id") is None or r.get("strava_activity_id") is None:
+            continue
+        out.append(r)
+    return out
+
+
 def sync_and_process_from_strava(
     token_info: dict,
     process_ski_activity_30s,
     process_run_walk_activity,
     params_by_sport: dict,
     days_back_if_empty: int = 200,
+    force_reprocess: bool = False,
+    reprocess_last_n: int = 0,
 ):
     athlete = token_info["athlete"]
     athlete_id = athlete["id"]
@@ -471,6 +516,9 @@ def sync_and_process_from_strava(
     refresh_token = token_info["refresh_token"]
     access_token = get_strava_access_token(refresh_token)
 
+    # -----------------------------
+    # 1) New activities since last sync (same as before)
+    # -----------------------------
     last_dt = get_last_activity_start_date(athlete_id)
 
     if last_dt:
@@ -480,28 +528,73 @@ def sync_and_process_from_strava(
             (datetime.now(timezone.utc) - timedelta(days=days_back_if_empty)).timestamp()
         )
 
-    activities = fetch_activities_since(access_token, after_ts)
-    activities = sorted(activities, key=lambda a: a.get("start_date") or "")
+    activities_new = fetch_activities_since(access_token, after_ts)
+    activities_new = sorted(activities_new, key=lambda a: a.get("start_date") or "")
+
+    # Map new activities by strava id (int) -> act dict
+    new_by_strava_id: dict[int, dict] = {}
+    for a in activities_new:
+        if a and a.get("id") is not None:
+            new_by_strava_id[int(a["id"])] = a
+
+    # -----------------------------
+    # 2) Reprocess set (last N from DB)
+    # -----------------------------
+    reprocess_rows: list[dict] = []
+    if reprocess_last_n and int(reprocess_last_n) > 0:
+        reprocess_rows = fetch_last_n_activity_rows_for_reprocess(athlete_id, int(reprocess_last_n))
+
+    # Build unified processing list:
+    # - process new acts first (as dicts)
+    # - then add reprocess rows not already in new list
+    items: list[dict] = []
+    for a in activities_new:
+        items.append({"mode": "new", "act": a})
+
+    # Add reprocess rows (mode=existing) where strava id not already included as "new"
+    for r in reprocess_rows:
+        sid = int(r["strava_activity_id"])
+        if sid in new_by_strava_id:
+            # already handled as "new" in this run
+            continue
+        items.append({"mode": "existing", "row": r})
 
     new_acts = 0
     total_segments = 0
 
-    for act in activities:
-        local_activity_id = upsert_activity_summary(act, user_id=athlete_id)
-        if local_activity_id is None:
-            continue
+    for item in items:
+        if item["mode"] == "new":
+            act = item["act"]
+            strava_activity_id = int(act["id"])
 
-        sport_group = map_sport_group(act.get("sport_type"))
-        if sport_group is None:
-            continue
+            local_activity_id = upsert_activity_summary(act, user_id=athlete_id)
+            if local_activity_id is None:
+                continue
 
-        streams = fetch_activity_streams(access_token, act["id"])
+            sport_group = map_sport_group(act.get("sport_type"))
+            if sport_group is None:
+                continue
+
+            start_date = act.get("start_date")
+
+        else:
+            row = item["row"]
+            local_activity_id = int(row["id"])
+            strava_activity_id = int(row["strava_activity_id"])
+            sport_group = str(row.get("sport_group") or map_sport_group(row.get("sport_type")) or "")
+            if sport_group not in ("run", "walk", "ski"):
+                continue
+            start_date = row.get("start_date")
+
+        # Fetch streams always (needed to rebuild segments)
+        streams = fetch_activity_streams(access_token, strava_activity_id)
         streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
 
         params = params_by_sport[sport_group]
         params_proc = dict(params)
         model_key = params_proc.pop("model_key", "unknown")
 
+        # Training ids exclude current
         train_ids = get_last_n_activity_ids_excluding(
             user_id=athlete_id,
             sport_group=sport_group,
@@ -509,6 +602,9 @@ def sync_and_process_from_strava(
             n=30,
         )
 
+        # -----------------------------
+        # RUN / WALK
+        # -----------------------------
         if sport_group in ("run", "walk"):
             train30 = fetch_training_segments_30s(
                 activity_ids=train_ids,
@@ -519,11 +615,20 @@ def sync_and_process_from_strava(
             slope_poly_global = fit_run_walk_slope_poly_from_segments(train30)
 
             seg30 = process_run_walk_activity(
-                act_row={"id": local_activity_id, "start_date": act.get("start_date")},
+                act_row={"id": local_activity_id, "start_date": start_date},
                 streams=streams_norm,
                 slope_poly_override=slope_poly_global,
                 **params_proc,
             )
+
+            # OVERWRITE if requested OR if this item is an existing row being reprocessed
+            if force_reprocess or item["mode"] == "existing":
+                delete_segments_30s(
+                    activity_id=local_activity_id,
+                    sport_group=sport_group,
+                    segment_seconds=30,
+                    model_key=model_key,
+                )
 
             total_segments += insert_segments_30s(
                 user_id=athlete_id,
@@ -533,10 +638,16 @@ def sync_and_process_from_strava(
                 segment_seconds=30,
                 model_key=model_key,
             )
-            new_acts += 1
+
+            if item["mode"] == "new":
+                new_acts += 1
+
             time.sleep(0.25)
             continue
 
+        # -----------------------------
+        # SKI
+        # -----------------------------
         if sport_group == "ski":
             train7 = fetch_training_segments_7s(train_ids, model_key=model_key)
             glide_poly_global = fit_glide_poly_from_7s(train7)
@@ -554,12 +665,16 @@ def sync_and_process_from_strava(
             )
 
             seg30, seg7 = process_ski_activity_30s(
-                act_row={"id": local_activity_id, "start_date": act.get("start_date")},
+                act_row={"id": local_activity_id, "start_date": start_date},
                 streams=streams_norm,
                 glide_poly_override=glide_poly_global,
                 slope_poly_override=slope_poly_global,
                 **params_proc,
             )
+
+            if force_reprocess or item["mode"] == "existing":
+                delete_segments_7s(local_activity_id, model_key)
+                delete_segments_30s(local_activity_id, "ski", 30, model_key)
 
             insert_segments_7s(
                 user_id=athlete_id,
@@ -577,7 +692,9 @@ def sync_and_process_from_strava(
                 model_key=model_key,
             )
 
-            new_acts += 1
+            if item["mode"] == "new":
+                new_acts += 1
+
             time.sleep(0.25)
             continue
 
