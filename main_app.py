@@ -23,10 +23,7 @@ def get_token_info():
     return None
 
 
-st.set_page_config(
-    page_title="onFlows – Strava → Supabase (segments)",
-    layout="wide",
-)
+st.set_page_config(page_title="onFlows – Strava → Supabase (segments)", layout="wide")
 st.title("onFlows – Strava → processing → Supabase")
 
 init_clients(st)
@@ -48,12 +45,7 @@ if not token_info:
 athlete = token_info["athlete"]
 user_id = athlete["id"]
 
-st.success(
-    f"Свързан си със Strava като: "
-    f"{athlete.get('username') or athlete.get('firstname')} "
-    f"{athlete.get('lastname')} "
-    f"(athlete_id={user_id})"
-)
+st.success(f"Свързан си със Strava като: {athlete.get('username') or athlete.get('firstname')} {athlete.get('lastname')} (athlete_id={user_id})")
 
 st.sidebar.header("Параметри")
 
@@ -73,23 +65,11 @@ k_par = st.sidebar.number_input("k_par", 0.0, 200.0, 35.0, 1.0)
 q_par = st.sidebar.number_input("q_par", 0.5, 3.0, 1.3, 0.05)
 gamma_cs = st.sidebar.number_input("gamma", 0.0, 2.0, 1.0, 0.05)
 
-days_back = st.sidebar.number_input(
-    "Days back (first sync)", min_value=1, max_value=5000, value=200, step=10
-)
+days_back = st.sidebar.number_input("Days back (first sync)", min_value=1, max_value=5000, value=200, step=10)
 
-# NEW: Reprocess / overwrite controls
 st.sidebar.subheader("Reprocess")
-force_reprocess = st.sidebar.checkbox(
-    "Force reprocess (overwrite existing segments)",
-    value=False,
-)
-reprocess_last_n = st.sidebar.number_input(
-    "Reprocess last N activities (0 = only new)",
-    min_value=0,
-    max_value=200,
-    value=0,
-    step=5,
-)
+force_reprocess = st.sidebar.checkbox("Force reprocess (overwrite existing segments)", value=False)
+reprocess_last_n = st.sidebar.number_input("Reprocess last N activities (0 = only new)", min_value=0, max_value=200, value=0, step=5)
 
 params_by_sport = {
     "ski": dict(
