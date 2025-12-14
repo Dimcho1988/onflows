@@ -55,22 +55,31 @@ def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
-# Fit slope poly from last-N (activities)
+# Fit slope poly from last-N (activities) - robust
 # -----------------------------
-def fit_slope_poly_lastN(seg_df: pd.DataFrame, deg: int = 2):
+def fit_slope_poly_lastN(
+    seg_df: pd.DataFrame,
+    deg: int = 2,
+    f_clip_min: float = 0.7,
+    f_clip_max: float = 1.7,
+    min_rows: int = 80,
+):
     """
-    Fit F_raw(s) from segments:
-      V0 = mean(v_raw) on near-flat slopes [-1,1]
-      F_raw = V0 / v_raw
-      polyfit(F_raw vs slope)
-      shift so F(0)=1
+    Robust fit:
+      - V0 per-activity from flat slopes [-1,1]
+      - F_raw = V0_activity / v_raw
+      - CLIP F_raw BEFORE polyfit
+      - shift so F(0)=1
     Returns np.poly1d or None.
     """
     if seg_df is None or seg_df.empty:
         return None
 
     df = seg_df.copy()
-    df = df.dropna(subset=["slope_pct", "v_kmh_raw"])
+    if "activity_id" not in df.columns:
+        df["activity_id"] = 0
+
+    df = df.dropna(subset=["activity_id", "slope_pct", "v_kmh_raw"])
     if df.empty:
         return None
 
@@ -81,15 +90,23 @@ def fit_slope_poly_lastN(seg_df: pd.DataFrame, deg: int = 2):
         & (df["v_kmh_raw"] > 3.0)
         & (df["v_kmh_raw"] < 30.0)
     )
-    df = df.loc[m, ["slope_pct", "v_kmh_raw"]].copy()
-    if len(df) < 10:
+    df = df.loc[m, ["activity_id", "slope_pct", "v_kmh_raw"]].copy()
+    if df.empty or len(df) < max(10, int(min_rows)):
         return None
 
-    V0 = df.loc[df["slope_pct"].between(-1.0, 1.0), "v_kmh_raw"].mean()
-    if not np.isfinite(V0) or V0 <= 0:
+    flat = df[df["slope_pct"].between(-1.0, 1.0)].copy()
+    if flat.empty:
         return None
 
-    df["F_raw"] = V0 / df["v_kmh_raw"]
+    v0_map = flat.groupby("activity_id")["v_kmh_raw"].mean().to_dict()
+    df["V0"] = df["activity_id"].map(v0_map)
+    df = df.dropna(subset=["V0"])
+    df = df[df["V0"] > 0]
+    if df.empty or len(df) < max(10, int(min_rows)):
+        return None
+
+    df["F_raw"] = (df["V0"] / df["v_kmh_raw"]).clip(lower=f_clip_min, upper=f_clip_max)
+
     x = df["slope_pct"].to_numpy(dtype=float)
     y = df["F_raw"].to_numpy(dtype=float)
 
@@ -101,9 +118,8 @@ def fit_slope_poly_lastN(seg_df: pd.DataFrame, deg: int = 2):
 
     # shift to enforce F(0)=1
     F0 = float(raw_poly(0.0))
-    offset = F0 - 1.0
     coeffs_corr = raw_poly.coefficients.copy()
-    coeffs_corr[-1] -= offset
+    coeffs_corr[-1] -= (F0 - 1.0)
     return np.poly1d(coeffs_corr)
 
 
@@ -201,17 +217,15 @@ def fetch_lastN_segments_for_fit(
     exclude_activity_id: int | None,
     n_acts: int = 30,
     lookback_limit: int = 200,
+    use_all_model_keys: bool = True,
 ) -> tuple[pd.DataFrame, list[int]]:
     """
     Returns (segments_df, activity_ids_used)
+    Uses up to last n_acts activities by start_date.
+    Optionally excludes current activity_id from training.
 
-    IMPORTANT FIX:
-    - First, we take a lookback list of recent activity IDs (limit=lookback_limit)
-    - Then we fetch segments for those IDs and keep ONLY activities that actually have segments
-      for (sport_group, segment_seconds, model_key)
-    - Finally, we select the first N activities WITH segments (rolling by recency)
+    If use_all_model_keys=True => ignores model_key in training fetch.
     """
-    # 1) recent activities (candidates)
     res = (
         supabase.table("activities")
         .select("id")
@@ -226,22 +240,25 @@ def fetch_lastN_segments_for_fit(
     if exclude_activity_id is not None:
         ids_all = [i for i in ids_all if int(i) != int(exclude_activity_id)]
 
-    if not ids_all:
+    ids = ids_all[: max(1, int(n_acts))]
+    if not ids:
         return pd.DataFrame(), []
 
-    # 2) fetch segments for all candidates (cheap columns)
-    res2 = (
+    q = (
         supabase.table("activity_segments")
-        .select("activity_id,seg_idx,slope_pct,v_kmh_raw,valid_basic,speed_spike")
-        .in_("activity_id", ids_all)
+        .select("activity_id,seg_idx,slope_pct,v_kmh_raw,valid_basic,speed_spike,model_key")
+        .in_("activity_id", ids)
         .eq("sport_group", sport_group)
-        .eq("segment_seconds", segment_seconds)
-        .eq("model_key", model_key)
-        .execute()
+        .eq("segment_seconds", int(segment_seconds))
     )
+
+    if not use_all_model_keys:
+        q = q.eq("model_key", model_key)
+
+    res2 = q.execute()
     df = pd.DataFrame(res2.data or [])
     if df.empty:
-        return df, []
+        return df, ids
 
     for c in ["slope_pct", "v_kmh_raw"]:
         if c in df.columns:
@@ -250,16 +267,7 @@ def fetch_lastN_segments_for_fit(
         if c in df.columns:
             df[c] = df[c].fillna(False).astype(bool)
 
-    # 3) keep only activities that really have at least some rows
-    ids_with_data = set(df["activity_id"].dropna().astype(int).unique().tolist())
-
-    # preserve recency order from ids_all
-    ids_used = [aid for aid in ids_all if aid in ids_with_data][: max(0, int(n_acts))]
-    if not ids_used:
-        return pd.DataFrame(), []
-
-    df = df[df["activity_id"].astype(int).isin(ids_used)].copy()
-    return df, ids_used
+    return df, ids
 
 
 # -----------------------------
@@ -283,10 +291,11 @@ with st.sidebar:
     st.subheader("Slope regression display")
     N_train = st.slider("N_train activities (rolling)", 1, 30, 30, 1)
     exclude_current = st.checkbox("Exclude текущата активност от training", value=True)
+    lookback_limit = st.number_input("Training lookback (max activities scanned)", 50, 500, 200, 10)
+    use_all_model_keys_train = st.checkbox("Training: използвай ALL model_key", value=True)
+
     alpha_slope_viz = st.slider("alpha_slope (display)", 0.0, 2.0, 1.0, 0.05)
     show_lastN_curve = st.checkbox("Show last-N fitted curve", value=True)
-    show_training_points = st.checkbox("Show training points (last-N)", value=True)
-    lookback_limit = st.slider("Lookback activities to search (for having segments)", 50, 400, 200, 25)
 
 acts = fetch_activities(int(user_id))
 if acts.empty:
@@ -369,13 +378,24 @@ with tabs[1]:
 
     st.subheader("Наклонен модел (точки + rolling last-N регресионна крива)")
 
-    # optional training points
-    train_seg = pd.DataFrame()
-    train_ids: list[int] = []
-    poly = None
+    scat = (
+        alt.Chart(dfm)
+        .mark_circle(size=45, opacity=0.55)
+        .encode(
+            x=alt.X("slope_pct:Q", title="наклон [%]"),
+            y=alt.Y("F_implied:Q", title="F (имплицитно = v_eq / v_raw)"),
+            tooltip=["slope_pct:Q", "v_kmh_raw:Q", f"{base_col}:Q", "F_implied:Q", "source:N"],
+            color=alt.Color("source:N", legend=alt.Legend(title="source"))
+        )
+        .properties(height=340)
+        .interactive()
+    )
 
-    if show_lastN_curve or show_training_points:
+    line = None
+
+    if show_lastN_curve:
         exclude_id = activity_id if exclude_current else None
+
         train_seg, train_ids = fetch_lastN_segments_for_fit(
             user_id=int(user_id),
             sport_group=sport_group,
@@ -384,82 +404,61 @@ with tabs[1]:
             exclude_activity_id=exclude_id,
             n_acts=int(N_train),
             lookback_limit=int(lookback_limit),
+            use_all_model_keys=bool(use_all_model_keys_train),
         )
 
-        activities_used = int(len(train_ids))
-        segments_used = int(len(train_seg))
-
-        st.caption(
-            f"Training set: activities_used={activities_used} (target N={int(N_train)}), "
-            f"segments={segments_used} | exclude_current={exclude_current} | lookback={lookback_limit}"
+        mk_txt = "ALL" if use_all_model_keys_train else str(model_key)
+        train_info = (
+            f"Training set: activities_used={len(train_ids)} (target N={int(N_train)}), "
+            f"segments={len(train_seg)} | model_key={mk_txt} | exclude_current={exclude_current} | lookback={int(lookback_limit)}"
         )
+        st.caption(train_info)
 
-        if show_training_points and (train_seg is not None) and (not train_seg.empty):
-            dft = train_seg.copy()
-            dft = dft.dropna(subset=["slope_pct", "v_kmh_raw"])
-            dft["F_implied"] = np.nan  # will be derived later only if we have base_col; training is raw-only here
-            dft["source"] = "training_lastN"
+        if train_seg is not None and not train_seg.empty:
+            train_plot = train_seg.copy()
+            train_plot = train_plot.dropna(subset=["slope_pct", "v_kmh_raw"])
+            train_plot["F_raw_tmp"] = np.nan
+            train_plot["source"] = "training_lastN"
 
-            # For training points, we can show F_raw = V0 / v_raw using the SAME V0 used inside fit()
-            # (recompute for visualization consistency)
-            mfit = (
-                dft["valid_basic"].fillna(True)
-                & (~dft["speed_spike"].fillna(False))
-                & dft["slope_pct"].between(-15.0, 15.0)
-                & (dft["v_kmh_raw"] > 3.0)
-                & (dft["v_kmh_raw"] < 30.0)
+            # for scatter of training: use global flat estimate just for visualization
+            v0_vis = train_plot.loc[train_plot["slope_pct"].between(-1.0, 1.0), "v_kmh_raw"].mean()
+            if np.isfinite(v0_vis) and v0_vis > 0:
+                train_plot["F_raw_tmp"] = (v0_vis / train_plot["v_kmh_raw"]).clip(0.5, 3.5)
+
+            scat_train = (
+                alt.Chart(train_plot.dropna(subset=["F_raw_tmp"]))
+                .mark_circle(size=35, opacity=0.35)
+                .encode(
+                    x="slope_pct:Q",
+                    y=alt.Y("F_raw_tmp:Q", title="F (имплицитно)"),
+                    tooltip=["activity_id:Q", "slope_pct:Q", "v_kmh_raw:Q", "F_raw_tmp:Q"],
+                    color=alt.Color("source:N", legend=alt.Legend(title="source"))
+                )
             )
-            dft2 = dft.loc[mfit, ["slope_pct", "v_kmh_raw"]].copy()
-            V0t = dft2.loc[dft2["slope_pct"].between(-1.0, 1.0), "v_kmh_raw"].mean()
-            if np.isfinite(V0t) and V0t > 0:
-                dft2["F_implied"] = V0t / dft2["v_kmh_raw"]
-                dft2["source"] = "training_lastN"
-                # merge points: selected + training
-                dfm_plot = pd.concat([dfm, dft2], ignore_index=True)
-            else:
-                dfm_plot = dfm.copy()
+
+            scat = scat + scat_train
+
+        poly = fit_slope_poly_lastN(train_seg, deg=2, f_clip_min=0.7, f_clip_max=1.7, min_rows=80)
+
+        if poly is None:
+            st.warning("Не успях да fit-на регресия от rolling last-N (липса на flat сегменти или твърде малко валидни данни).")
         else:
-            dfm_plot = dfm.copy()
+            s_grid = np.linspace(-15, 15, 241)
+            F_grid = poly(s_grid)
+            F_grid = apply_shape_constraints(F_grid, s_grid, fmin=0.7, fmax=1.7, alpha=alpha_slope_viz)
 
-        if show_lastN_curve:
-            poly = fit_slope_poly_lastN(train_seg, deg=2)
-            if poly is None:
-                st.warning("Не успях да fit-на регресия от rolling last-N (липса на flat сегменти или твърде малко валидни данни).")
-            else:
-                st.caption(f"Fit: poly deg=2 (shifted F(0)=1) + constraints + alpha={alpha_slope_viz:.2f}")
-
-    else:
-        dfm_plot = dfm.copy()
-
-    scat = (
-        alt.Chart(dfm_plot)
-        .mark_circle(size=45, opacity=0.55)
-        .encode(
-            x=alt.X("slope_pct:Q", title="наклон [%]"),
-            y=alt.Y("F_implied:Q", title="F (имплицитно = v_eq/v_raw или V0/v_raw за training)"),
-            color=alt.Color("source:N", legend=alt.Legend(title="source")),
-            tooltip=["source:N", "slope_pct:Q", "v_kmh_raw:Q", "F_implied:Q"],
-        )
-        .properties(height=340)
-        .interactive()
-    )
-
-    line = None
-    if show_lastN_curve and poly is not None:
-        s_grid = np.linspace(-15, 15, 241)
-        F_grid = poly(s_grid)
-        F_grid = apply_shape_constraints(F_grid, s_grid, fmin=0.7, fmax=1.7, alpha=alpha_slope_viz)
-
-        df_line = pd.DataFrame({"slope_pct": s_grid, "F_fit": F_grid})
-        line = (
-            alt.Chart(df_line)
-            .mark_line()
-            .encode(
-                x="slope_pct:Q",
-                y=alt.Y("F_fit:Q", title="F"),
-                tooltip=["slope_pct:Q", "F_fit:Q"],
+            df_line = pd.DataFrame({"slope_pct": s_grid, "F_fit": F_grid})
+            line = (
+                alt.Chart(df_line)
+                .mark_line()
+                .encode(
+                    x="slope_pct:Q",
+                    y=alt.Y("F_fit:Q", title="F"),
+                    tooltip=["slope_pct:Q", "F_fit:Q"],
+                )
             )
-        )
+
+            st.caption(f"Fit: poly deg=2 (shifted F(0)=1) + constraints + alpha={alpha_slope_viz:.2f}")
 
     if line is not None:
         st.altair_chart(scat + line, use_container_width=True)
