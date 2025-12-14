@@ -54,6 +54,29 @@ def zones_from_intensity(intensity: np.ndarray) -> np.ndarray:
     return z
 
 
+
+ZONE_BOUNDS = [0.0, 0.75, 0.85, 0.95, 1.05, 1.15, np.inf]
+ZONE_NAMES = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
+
+def zone_ranges_table(reference_value: float, ref_name: str = "CS") -> pd.DataFrame:
+    """Return a table of zone ranges, both relative and in km/h, using the same bounds as zones_from_intensity."""
+    ref = float(reference_value) if reference_value is not None else np.nan
+    rows = []
+    for i, z in enumerate(ZONE_NAMES):
+        lo = float(ZONE_BOUNDS[i])
+        hi = float(ZONE_BOUNDS[i + 1])
+        lo_kmh = lo * ref if np.isfinite(ref) else np.nan
+        hi_kmh = hi * ref if (np.isfinite(ref) and np.isfinite(hi)) else np.nan
+        rows.append({
+            "Zone": z,
+            "rel_from": lo,
+            "rel_to": hi if np.isfinite(hi) else np.inf,
+            "kmh_from": lo_kmh,
+            "kmh_to": hi_kmh if np.isfinite(hi_kmh) else np.inf,
+            "reference": ref_name,
+        })
+    return pd.DataFrame(rows)
+
 # -----------------------------
 # Fit slope poly from last-N (activities) - robust
 # -----------------------------
@@ -616,4 +639,3 @@ with tabs[4]:
 
     st.markdown("### Raw segments (preview, първите 200)")
     st.dataframe(dfz.head(200), use_container_width=True)
-
