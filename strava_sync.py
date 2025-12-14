@@ -1,11 +1,11 @@
 import time
 from datetime import datetime, timedelta, timezone
 
-import requests
-import streamlit as st
 import numpy as np
 import pandas as pd
-from supabase import create_client, Client
+import requests
+import streamlit as st
+from supabase import Client, create_client
 
 # -------------------------------------------------
 # Globals
@@ -17,7 +17,7 @@ STRAVA_CLIENT_SECRET = None
 
 supabase: Client | None = None
 
-# NEW: training can ignore model_key
+# Train models using all model_key variants by default
 USE_ALL_MODEL_KEYS_FOR_TRAINING = True
 
 
@@ -62,14 +62,12 @@ def exchange_code_for_tokens(auth_code: str) -> dict:
 
 def get_strava_access_token(refresh_token: str) -> str:
     token_url = "https://www.strava.com/oauth/token"
-
     data = {
         "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-
     resp = requests.post(token_url, data=data, timeout=20)
     resp.raise_for_status()
     return resp.json()["access_token"]
@@ -78,34 +76,25 @@ def get_strava_access_token(refresh_token: str) -> str:
 def fetch_activities_since(access_token: str, after_ts: int) -> list[dict]:
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
-
     all_activities = []
     page = 1
     per_page = 50
-
     while True:
         params = {"after": after_ts, "page": page, "per_page": per_page}
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         chunk = r.json()
-
         if not chunk:
             break
-
         all_activities.extend(chunk)
         page += 1
-
     return all_activities
 
 
 def fetch_activity_streams(access_token: str, strava_activity_id: int) -> dict:
     url = f"https://www.strava.com/api/v3/activities/{strava_activity_id}/streams"
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {
-        "keys": "time,distance,altitude,heartrate,latlng",
-        "key_by_type": "true",
-    }
-
+    params = {"keys": "time,distance,altitude,heartrate,latlng", "key_by_type": "true"}
     r = requests.get(url, headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
@@ -135,11 +124,9 @@ def get_last_activity_start_date(user_id: int):
             .limit(1)
             .execute()
         )
-
         data = res.data or []
         if not data:
             return None
-
         return datetime.fromisoformat(data[0]["start_date"].replace("Z", "+00:00"))
     except Exception:
         return None
@@ -168,31 +155,16 @@ def upsert_activity_summary(act: dict, user_id: int) -> int | None:
         "avg_heartrate": act.get("average_heartrate"),
         "max_heartrate": act.get("max_heartrate"),
     }
-
     row = {k: v for k, v in row.items() if v is not None}
 
-    res = (
-        supabase.table("activities")
-        .upsert(row, on_conflict="strava_activity_id")
-        .execute()
-    )
-
+    res = supabase.table("activities").upsert(row, on_conflict="strava_activity_id").execute()
     data = res.data or []
     if not data:
         return None
-
-    return data[0]["id"]
-
-
-    return data[0]["id"]
+    return int(data[0]["id"])
 
 
-def get_last_n_activity_ids_excluding(
-    user_id: int,
-    sport_group: str,
-    exclude_activity_id: int,
-    n: int = 30
-) -> list[int]:
+def get_last_n_activity_ids_excluding(user_id: int, sport_group: str, exclude_activity_id: int, n: int = 30) -> list[int]:
     res = (
         supabase.table("activities")
         .select("id")
@@ -203,16 +175,11 @@ def get_last_n_activity_ids_excluding(
         .execute()
     )
     rows = res.data or []
-    ids = [r["id"] for r in rows if r.get("id") is not None and r["id"] != exclude_activity_id]
+    ids = [int(r["id"]) for r in rows if r.get("id") is not None and int(r["id"]) != int(exclude_activity_id)]
     return ids[:n]
 
 
-def fetch_training_segments_30s(
-    activity_ids: list[int],
-    sport_group: str,
-    segment_seconds: int,
-    model_key: str,
-) -> pd.DataFrame:
+def fetch_training_segments_30s(activity_ids: list[int], sport_group: str, segment_seconds: int, model_key: str) -> pd.DataFrame:
     if not activity_ids:
         return pd.DataFrame()
 
@@ -221,15 +188,12 @@ def fetch_training_segments_30s(
         .select("*")
         .in_("activity_id", activity_ids)
         .eq("sport_group", sport_group)
-        .eq("segment_seconds", segment_seconds)
+        .eq("segment_seconds", int(segment_seconds))
     )
-
-    # NEW: optionally ignore model_key for training
     if not USE_ALL_MODEL_KEYS_FOR_TRAINING:
         q = q.eq("model_key", model_key)
 
     res = q.execute()
-
     df = pd.DataFrame(res.data or [])
     if df.empty:
         return df
@@ -244,26 +208,15 @@ def fetch_training_segments_30s(
     return df
 
 
-def fetch_training_segments_7s(
-    activity_ids: list[int],
-    model_key: str,
-) -> pd.DataFrame:
+def fetch_training_segments_7s(activity_ids: list[int], model_key: str) -> pd.DataFrame:
     if not activity_ids:
         return pd.DataFrame()
 
-    q = (
-        supabase.table("activity_segments_7s")
-        .select("*")
-        .in_("activity_id", activity_ids)
-        .eq("sport_group", "ski")
-    )
-
-    # NEW: optionally ignore model_key for training
+    q = supabase.table("activity_segments_7s").select("*").in_("activity_id", activity_ids).eq("sport_group", "ski")
     if not USE_ALL_MODEL_KEYS_FOR_TRAINING:
         q = q.eq("model_key", model_key)
 
     res = q.execute()
-
     df = pd.DataFrame(res.data or [])
     if df.empty:
         return df
@@ -361,14 +314,7 @@ def fit_ski_slope_poly_from_30s(train30: pd.DataFrame, glide_poly_for_training, 
     return fit_slope_poly(slope_train)
 
 
-def insert_segments_30s(
-    user_id: int,
-    sport_group: str,
-    activity_id: int,
-    seg_df,
-    segment_seconds: int,
-    model_key: str,
-) -> int:
+def insert_segments_30s(user_id: int, sport_group: str, activity_id: int, seg_df, segment_seconds: int, model_key: str) -> int:
     if seg_df is None or getattr(seg_df, "empty", False):
         return 0
 
@@ -386,11 +332,11 @@ def insert_segments_30s(
         if c not in df.columns:
             df[c] = None
 
-    df["user_id"] = user_id
-    df["sport_group"] = sport_group
-    df["activity_id"] = activity_id
-    df["segment_seconds"] = segment_seconds
-    df["model_key"] = model_key
+    df["user_id"] = int(user_id)
+    df["sport_group"] = str(sport_group)
+    df["activity_id"] = int(activity_id)
+    df["segment_seconds"] = int(segment_seconds)
+    df["model_key"] = str(model_key)
 
     for col in ["t_start", "t_end"]:
         if col in df.columns:
@@ -398,9 +344,7 @@ def insert_segments_30s(
 
     df = df.replace({np.nan: None})
 
-    rows = df[
-        ["user_id", "sport_group", "activity_id", "segment_seconds", "model_key"] + wanted
-    ].to_dict(orient="records")
+    rows = df[["user_id", "sport_group", "activity_id", "segment_seconds", "model_key"] + wanted].to_dict(orient="records")
 
     total = 0
     for i in range(0, len(rows), 1000):
@@ -410,16 +354,10 @@ def insert_segments_30s(
             on_conflict="activity_id,sport_group,segment_seconds,seg_idx,model_key",
         ).execute()
         total += len(chunk)
-
     return total
 
 
-def insert_segments_7s(
-    user_id: int,
-    activity_id: int,
-    seg7_df,
-    model_key: str,
-) -> int:
+def insert_segments_7s(user_id: int, activity_id: int, seg7_df, model_key: str) -> int:
     if seg7_df is None or getattr(seg7_df, "empty", False):
         return 0
 
@@ -434,20 +372,17 @@ def insert_segments_7s(
         if c not in df.columns:
             df[c] = None
 
-    df["user_id"] = user_id
-    df["activity_id"] = activity_id
+    df["user_id"] = int(user_id)
+    df["activity_id"] = int(activity_id)
     df["sport_group"] = "ski"
-    df["model_key"] = model_key
+    df["model_key"] = str(model_key)
 
     for col in ["t_start", "t_end"]:
         if col in df.columns:
             df[col] = df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else x)
 
     df = df.replace({np.nan: None})
-
-    rows = df[
-        ["user_id", "activity_id", "sport_group", "model_key"] + wanted
-    ].to_dict(orient="records")
+    rows = df[["user_id", "activity_id", "sport_group", "model_key"] + wanted].to_dict(orient="records")
 
     total = 0
     for i in range(0, len(rows), 1000):
@@ -457,40 +392,29 @@ def insert_segments_7s(
             on_conflict="activity_id,seg_idx,model_key",
         ).execute()
         total += len(chunk)
-
     return total
 
 
-
 # -----------------------------
-# Deletion helpers for overwrite / reprocess
+# OVERWRITE DELETE (IMPORTANT): delete ALL model_key for this activity+sport+segment_seconds
 # -----------------------------
-def delete_segments_30s(activity_id: int, sport_group: str, segment_seconds: int, model_key: str):
-    """Delete 30s segments for one activity/version so we can overwrite."""
-    (
-        supabase.table("activity_segments")
-        .delete()
-        .eq("activity_id", int(activity_id))
-        .eq("sport_group", str(sport_group))
-        .eq("segment_seconds", int(segment_seconds))
-        .eq("model_key", str(model_key))
+def delete_segments_30s(activity_id: int, sport_group: str, segment_seconds: int):
+    supabase.table("activity_segments") \
+        .delete() \
+        .eq("activity_id", int(activity_id)) \
+        .eq("sport_group", str(sport_group)) \
+        .eq("segment_seconds", int(segment_seconds)) \
         .execute()
-    )
 
 
-def delete_segments_7s(activity_id: int, model_key: str):
-    """Delete 7s segments for one activity/version so we can overwrite."""
-    (
-        supabase.table("activity_segments_7s")
-        .delete()
-        .eq("activity_id", int(activity_id))
-        .eq("model_key", str(model_key))
+def delete_segments_7s(activity_id: int):
+    supabase.table("activity_segments_7s") \
+        .delete() \
+        .eq("activity_id", int(activity_id)) \
         .execute()
-    )
 
 
 def fetch_last_n_activity_rows_for_reprocess(user_id: int, n: int) -> list[dict]:
-    """Fetch last N activities from DB to allow reprocess even if not new."""
     res = (
         supabase.table("activities")
         .select("id,strava_activity_id,sport_group,sport_type,start_date")
@@ -507,6 +431,7 @@ def fetch_last_n_activity_rows_for_reprocess(user_id: int, n: int) -> list[dict]
         out.append(r)
     return out
 
+
 def sync_and_process_from_strava(
     token_info: dict,
     process_ski_activity_30s,
@@ -517,35 +442,28 @@ def sync_and_process_from_strava(
     reprocess_last_n: int = 0,
 ):
     athlete = token_info["athlete"]
-    athlete_id = athlete["id"]
+    athlete_id = int(athlete["id"])
 
-    refresh_token = token_info["refresh_token"]
-    access_token = get_strava_access_token(refresh_token)
+    access_token = get_strava_access_token(token_info["refresh_token"])
 
+    # 1) New activities since last sync
     last_dt = get_last_activity_start_date(athlete_id)
-
     if last_dt:
         after_ts = int(last_dt.timestamp()) - 60
     else:
-        after_ts = int(
-            (datetime.now(timezone.utc) - timedelta(days=days_back_if_empty)).timestamp()
-        )
+        after_ts = int((datetime.now(timezone.utc) - timedelta(days=days_back_if_empty)).timestamp())
 
-    activities = fetch_activities_since(access_token, after_ts)
-    activities = sorted(activities, key=lambda a: a.get("start_date") or "")
+    activities_new = fetch_activities_since(access_token, after_ts)
+    activities_new = sorted(activities_new, key=lambda a: a.get("start_date") or "")
 
-    # Map new activities by strava id for quick check
-    new_by_strava_id = {int(a["id"]): a for a in activities if a and a.get("id") is not None}
+    new_by_strava_id: dict[int, dict] = {int(a["id"]): a for a in activities_new if a and a.get("id") is not None}
 
-    # Optional: also reprocess last N activities from DB (even if not new)
+    # 2) Reprocess last N from DB (optional)
     reprocess_rows: list[dict] = []
     if reprocess_last_n and int(reprocess_last_n) > 0:
         reprocess_rows = fetch_last_n_activity_rows_for_reprocess(athlete_id, int(reprocess_last_n))
 
-    # Unified processing list: new activities first, then existing rows not already in new
-    items: list[dict] = []
-    for a in activities:
-        items.append({"mode": "new", "act": a})
+    items: list[dict] = [{"mode": "new", "act": a} for a in activities_new]
     for r in reprocess_rows:
         sid = int(r["strava_activity_id"])
         if sid in new_by_strava_id:
@@ -558,6 +476,8 @@ def sync_and_process_from_strava(
     for item in items:
         if item["mode"] == "new":
             act = item["act"]
+            strava_activity_id = int(act["id"])
+
             local_activity_id = upsert_activity_summary(act, user_id=athlete_id)
             if local_activity_id is None:
                 continue
@@ -566,7 +486,6 @@ def sync_and_process_from_strava(
             if sport_group is None:
                 continue
 
-            strava_activity_id = int(act["id"])
             start_date = act.get("start_date")
         else:
             row = item["row"]
@@ -577,7 +496,6 @@ def sync_and_process_from_strava(
                 continue
             start_date = row.get("start_date")
 
-        # Always fetch streams when (re)processing
         streams = fetch_activity_streams(access_token, strava_activity_id)
         streams_norm = {k: {"data": v.get("data", [])} for k, v in streams.items()}
 
@@ -592,13 +510,9 @@ def sync_and_process_from_strava(
             n=30,
         )
 
+        # RUN / WALK
         if sport_group in ("run", "walk"):
-            train30 = fetch_training_segments_30s(
-                activity_ids=train_ids,
-                sport_group=sport_group,
-                segment_seconds=30,
-                model_key=model_key,
-            )
+            train30 = fetch_training_segments_30s(train_ids, sport_group, 30, model_key)
             slope_poly_global = fit_run_walk_slope_poly_from_segments(train30)
 
             seg30 = process_run_walk_activity(
@@ -609,7 +523,7 @@ def sync_and_process_from_strava(
             )
 
             if force_reprocess or item["mode"] == "existing":
-                delete_segments_30s(local_activity_id, sport_group, 30, model_key)
+                delete_segments_30s(local_activity_id, sport_group, 30)
 
             total_segments += insert_segments_30s(
                 user_id=athlete_id,
@@ -619,25 +533,23 @@ def sync_and_process_from_strava(
                 segment_seconds=30,
                 model_key=model_key,
             )
+
             if item["mode"] == "new":
                 new_acts += 1
-            time.sleep(0.25)
+
+            time.sleep(0.2)
             continue
 
+        # SKI
         if sport_group == "ski":
             train7 = fetch_training_segments_7s(train_ids, model_key=model_key)
             glide_poly_global = fit_glide_poly_from_7s(train7)
 
-            train30 = fetch_training_segments_30s(
-                activity_ids=train_ids,
-                sport_group="ski",
-                segment_seconds=30,
-                model_key=model_key,
-            )
+            train30 = fetch_training_segments_30s(train_ids, "ski", 30, model_key)
             slope_poly_global = fit_ski_slope_poly_from_30s(
                 train30=train30,
                 glide_poly_for_training=glide_poly_global,
-                damp_glide=params_proc.get("DAMP_GLIDE", 1.0),
+                damp_glide=float(params_proc.get("DAMP_GLIDE", 1.0)),
             )
 
             seg30, seg7 = process_ski_activity_30s(
@@ -649,27 +561,16 @@ def sync_and_process_from_strava(
             )
 
             if force_reprocess or item["mode"] == "existing":
-                delete_segments_7s(local_activity_id, model_key)
-                delete_segments_30s(local_activity_id, "ski", 30, model_key)
+                delete_segments_7s(local_activity_id)
+                delete_segments_30s(local_activity_id, "ski", 30)
 
-            insert_segments_7s(
-                user_id=athlete_id,
-                activity_id=local_activity_id,
-                seg7_df=seg7,
-                model_key=model_key,
-            )
+            insert_segments_7s(athlete_id, local_activity_id, seg7, model_key)
+            total_segments += insert_segments_30s(athlete_id, "ski", local_activity_id, seg30, 30, model_key)
 
-            total_segments += insert_segments_30s(
-                user_id=athlete_id,
-                sport_group="ski",
-                activity_id=local_activity_id,
-                seg_df=seg30,
-                segment_seconds=30,
-                model_key=model_key,
-            )
             if item["mode"] == "new":
                 new_acts += 1
-            time.sleep(0.25)
+
+            time.sleep(0.2)
             continue
 
     return new_acts, total_segments
